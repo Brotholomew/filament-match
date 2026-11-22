@@ -2,20 +2,17 @@
 
 Filament Match reads the filament loaded in each printer slot, finds the best matching OrcaSlicer filament preset, lets you review and change the match, and applies the result to your project. Spoolman and the Open Filament Database are optional enrichments, not requirements.
 
-It is a matcher and review layer, not a preset generator. It works with the presets already installed in Orca and remembers the spool, tag and filament mappings you confirm.
+It does not generate presets; it remembers the spool, tag and filament mappings you confirm.
 
 ## Highlights
 
-- Reads filament data directly from the connected Moonraker or Snapmaker printer. There is no printer IP field; the address comes from Orca.
-- Matches every feed to a compatible installed Orca filament preset and shows why it matched.
-- Scans automatically when the panel opens, but writes nothing to Orca until you press **Apply**.
+- Reads filament data directly from the connected Moonraker or Snapmaker printer; there is no printer IP field.
+- Matches every feed to a compatible installed preset and shows why it matched.
+- Scans automatically, but writes nothing to Orca until you press **Apply**.
 - Lets you edit the detected vendor, material, subtype, product and colour, then rerun matching with **Match**.
-- Opens a chooser when more than one preset is a viable match.
-- Optional Spoolman enrichment by spool ID, including vendor, product, material, colour, temperatures, subtype and per-kg price sync.
-- Manual price entry works without Spoolman.
-- Uses the Open Filament Database to propose presets for filaments that are not installed, with a local index cache.
-- Handles printer/project slot-count mismatches without silently changing the project.
-- Remembers confirmed spool/tag/filament mappings across restarts.
+- Spoolman enrichment by spool ID, including per-kg price sync; manual price entry works.
+- Uses the Open Filament Database for missing filaments, with a local cache.
+- Handles slot-count mismatches without silently changing the project.
 - Pure Python, no third-party packages, macOS/Windows/Linux.
 
 ## How to install
@@ -41,15 +38,9 @@ cd filament-match
 ./plugin/install.sh
 ```
 
-On Linux, pass your Orca data directory if it is not the default:
+On Linux, pass `"$HOME/.config/OrcaSlicer"` to the installer if it is not the default. On Windows, build `plugin/dist/filament_match.py` with `python plugin\build_single_file.py` and copy it to `%APPDATA%\OrcaSlicer\orca_plugins\filament_match\`. Restart Orca afterwards.
 
-```sh
-./plugin/install.sh "$HOME/.config/OrcaSlicer"
-```
-
-Windows: build `plugin/dist/filament_match.py` with `python plugin\build_single_file.py` and copy it to `%APPDATA%\OrcaSlicer\orca_plugins\filament_match\filament_match.py`, then restart Orca.
-
-Do not enable the local development copy and the Orca Cloud subscription at the same time; they use separate plugin folders and both would auto-load.
+Do not enable the local development copy and the Orca Cloud subscription at the same time; both would auto-load.
 
 ## Plugin usage
 
@@ -75,13 +66,7 @@ Do not enable the local development copy and the Orca Cloud subscription at the 
 
    ![Re-scan the printer](https://api.orcaslicer.com/api/v1/bundles/media/35827c85-155a-41e1-bbc6-b85d0b705711/content)
 
-6. You may have to approve the printer permission checks again:
-
-   ![Printer permissions again, step 1](https://api.orcaslicer.com/api/v1/bundles/media/3d8560cd-a5de-48b0-b9ac-e46ede038aa9/content)
-
-   ![Printer permissions again, step 2](https://api.orcaslicer.com/api/v1/bundles/media/37b82423-bfa6-4baf-a71d-fbebbe7e63f4/content)
-
-   ![Printer permissions again, step 3](https://api.orcaslicer.com/api/v1/bundles/media/3ea0ea21-a218-4e2d-8b7a-75145d5cb71e/content)
+6. You may have to approve the printer permission checks again.
 
 7. The presets are matched to your printer's spools. Missing presets are fetched from the Open Filament Database. Review the rows and press **Apply** to write the selected presets to Orca:
 
@@ -109,80 +94,58 @@ Do not enable the local development copy and the Orca Cloud subscription at the 
 
 ### What Match and Apply do
 
-- Scanning selects the best candidate in each row. It does not change Orca.
-- The preset input shows the current selection. Choosing another entry changes the selection only.
-- The pencil button opens that preset's settings in a popup. It does not edit the preset itself.
-- The chevron expands the fields used for matching.
-- **Match** reruns matching from the edited fields and changes the selection only. It deliberately ignores confirmed history.
-- **Apply** writes every changed selection to Orca and remembers the confirmed spool, tag and filament mappings. If one row fails, the other rows are still applied and the failure is shown on that row.
-- On the first scan, the best candidate is selected even when several are plausible; no popup opens. If **Match** produces more than one viable candidate, the chooser opens.
-- A lone OFD candidate is preselected as **Library match**. Press **Apply** to install it.
-- Use the small **↻** button to scan again after changing the printer, spools or presets.
-
-The plugin does not hook Orca's native **Sync filaments** button. It reads the printer itself and leaves Orca's own button untouched.
+- Scanning selects the best candidate; choosing an entry in the preset input changes the selection only.
+- **Match** reruns matching from the edited fields, ignores confirmed history, and opens the chooser when more than one candidate is viable.
+- **Apply** writes changes to Orca and remembers confirmed spool, tag and filament mappings. A lone OFD candidate is installed on Apply.
+- The plugin does not hook Orca's native **Sync filaments** button.
 
 ## Filament prices
 
 Expand a feed to see **Current price (per kg)**, **New price (per kg)**, **Fetch price** and **Save price** after the Match button.
 
 - **Current price** is the chosen preset's `filament_cost`.
-- **Fetch price** reads the feed's Spoolman spool and converts the whole-spool price to Orca's per-kg price: `(spool.price ?? filament.price) / ((spool.initial_weight ?? filament.weight) / 1000)`.
-- **Save price** stages the new price. **Apply** writes it into the preset.
-- On the first scan, Spoolman prices are loaded into **New price** automatically. A rescan preserves a value you edited or fetched.
-- Changing the chosen preset reloads **Current price** but leaves **New price** alone.
-- If Spoolman is blank, invalid or unreachable, Fetch is disabled with a tooltip; manual new prices still work.
+- **Fetch price** reads the Spoolman spool and converts the whole-spool price to Orca's per-kg price: `(spool.price ?? filament.price) / ((spool.initial_weight ?? filament.weight) / 1000)`.
+- **Save price** stages the new price; **Apply** writes it into the preset.
+- Spoolman prices load into **New price** on the first scan. A rescan preserves a value you edited or fetched; changing the preset reloads **Current price** but leaves **New price** alone.
+- If Spoolman is blank, invalid or unreachable, Fetch is disabled; manual prices still work.
 
-**Changes are applied only after you press `Save price` and then `Apply` at the top of the plugin pane.** If you do not have a Spoolman instance, you can still type a price into **New price** and save it the same way.
+**Changes are applied only after you press `Save price` and then `Apply` at the top of the plugin pane.** Without Spoolman, type a price into **New price** and save it the same way.
 
-Orca's plugin API cannot save an existing preset. Plugin-owned local presets are updated in place. A system preset gets a local copy named `<preset base> (local)` that inherits the system preset. A user preset is flattened into the copy and inherits its system parent, because Orca's local bundle loader cannot resolve a user-preset parent and silently skips such a copy. If multiple feeds share a preset, the last applied price wins.
+Orca's plugin API cannot save an existing preset. Plugin-owned local presets are updated in place. A system preset gets a `<preset base> (local)` copy inheriting the system preset. A user preset is flattened into the copy and inherits its system parent, because Orca's local bundle loader cannot resolve a user-preset parent and skips such a copy. If multiple feeds share a preset, the last applied price wins.
 
-The matcher ignores Orca's internal `_local/<bundle>/` prefix and the labels `(local)`, `(custom)`, `(OFD)` and `(copy)`, so custom and local copies are exact candidates. A `(local)` price copy ranks before its original. Price fields are metadata only and do not participate in filament matching.
+The matcher ignores Orca's internal `_local/<bundle>/` prefix and the labels `(local)`, `(custom)`, `(OFD)` and `(copy)`, so custom and local copies are exact candidates. A `(local)` price copy ranks before its original. Price fields are metadata only and do not participate in matching.
 
 ## Spoolman
 
-Spoolman is optional enrichment by spool ID:
-
-- the printer supplies slot data and often a spool ID;
-- Spoolman fills vendor, product name, material, colour and temperatures when the printer does not;
-- a Spoolman extra field (`orca_filament_preset` or `orca_preset`) can be used as an explicit preset hint;
-- a Spoolman `variant` extra fills the subtype when the printer did not report one (for example `SnapSpeed`). A printer-reported subtype always wins.
+Spoolman is optional enrichment by spool ID. The printer supplies slot data and often a spool ID; Spoolman fills vendor, product name, material, colour and temperatures when the printer does not. A Spoolman extra field (`orca_filament_preset` or `orca_preset`) can be used as an explicit preset hint, and a `variant` extra fills the subtype when the printer did not report one (for example `SnapSpeed`). A printer-reported subtype always wins.
 
 Spoolman does not provide Orca's preset list, does not perform the matching and is not needed for the plugin to work.
 
 ## Matching order
 
-1. A user-confirmed mapping for the exact spool/tag/filament identity, but only if the mapped preset still fits the current vendor/material/subtype/product (and colour when the preset has one). A stale refill mapping falls through.
-2. Exact printer-reported Orca `filament_id` among compatible installed presets.
-3. Exact vendor + material + subtype + product. Product text that is only a colour, only the vendor/material, or the material plus a grade word does not count as a product constraint. Meaningful names such as `ABS Pastel` or `PETG Matte` still do.
-4. A fuzzy name/colour match above a confidence threshold.
-5. An optional Open Filament Database candidate.
-6. The exact compatible `Generic <material>` preset, not a variant such as `Generic PLA-CF`, unless no exact generic material preset exists.
+1. A confirmed mapping for the exact spool/tag/filament identity, while the preset still fits the current vendor/material/subtype/product and colour.
+2. Exact printer-reported Orca `filament_id`, then exact vendor + material + subtype + product. Colour-only, vendor/material-only, or material + grade words do not count as a product constraint.
+3. A fuzzy name/colour match above a confidence threshold.
+4. An optional Open Filament Database candidate, then the exact compatible `Generic <material>` preset (not a variant such as `Generic PLA-CF`).
 
-History is stored in Orca's per-plugin data folder and survives restarts and plugin reinstalls. Only user-confirmed matches are recorded; automatic generic fallbacks are not.
+History survives restarts and plugin reinstalls. Only user-confirmed matches are recorded.
 
 ## Slot count mismatch
 
-OrcaSlicer 2.5.2 has no plugin API to add, remove or resize project filament slots, so the plugin never silently changes Orca's slot count:
-
-- if the printer reports more feeds than the project has slots, the extra feeds are shown as **No Orca slot** and skipped by **Apply**; the panel shows exactly how many slots to add;
-- if the project has more slots than the printer reports, the extra project slots are left untouched; the panel shows how many to remove.
-
-Add or remove the stated number of filaments in Orca's **Filament** tab, then press **↻**.
+OrcaSlicer 2.5.2 has no plugin API to add, remove or resize project filament slots, so the plugin never silently changes Orca's slot count. Extra printer feeds are shown as **No Orca slot** and skipped by **Apply**, with the number of slots to add. Extra project slots are left untouched, with the number to remove. Add or remove filaments in Orca's **Filament** tab, then press **↻**.
 
 ## Limitations
 
-- OrcaSlicer's plugin API cannot add a button next to the native **Synchronize filament list from AMS** button. The plugin opens a docked panel instead.
-- The plugin cannot override Orca's native AMS/filament sync. There is no sync-complete event or tray-payload plugin API.
-- The plugin cannot open Orca's native Filament Settings dialog. The pencil button shows the preset's settings in the plugin's own popup.
+- Orca's plugin API cannot add a button next to the native **Synchronize filament list from AMS** action, override native AMS sync, or open the native Filament Settings dialog. The plugin opens a docked panel and its own settings popup instead.
 - `begin_update` is shipped but undocumented; applying a match reports failures instead of silently ignoring them.
-- System presets are often served from `.opc` caches, so the plugin does not rely on reading their JSON or on their `filament_id`.
+- System presets are often served from `.opc` caches, so the plugin does not rely on reading their JSON or `filament_id`.
 - Generic Moonraker reports material/colour/filament ID, not vendor/subtype. Those fields stay blank unless Spoolman or a richer printer API supplies them.
 - Do not run another plugin that also changes filament slots at the same time.
 
 ## Troubleshooting
 
-**The plugin does not appear.** Restart Orca, open **File → Plugins**, and check that **Filament Match** is enabled. If you installed from source, the plugin folder must contain exactly one direct `.py` file: `orca_plugins/filament_match/filament_match.py`.
+**The plugin does not appear.** Restart Orca, open **File → Plugins**, and check that **Filament Match** is enabled. A source install must contain exactly one direct `.py` file: `orca_plugins/filament_match/filament_match.py`.
 
 **A network request was denied.** Orca asks once per base origin: the printer address, the Spoolman address and the OFD. Approve the prompt and press **↻**.
 
-**An old version keeps loading.** Older source installs sometimes left a folder named `orca_plugins/filament_match.py/`. Orca loads that folder instead of `orca_plugins/filament_match/`. Remove the legacy folder and restart Orca. Current versions of `plugin/install.sh` remove it automatically.
+**An old version keeps loading.** Older source installs sometimes left `orca_plugins/filament_match.py/`, which shadows `orca_plugins/filament_match/`. Remove the legacy folder and restart Orca; current installers do this automatically.

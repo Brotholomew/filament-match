@@ -76,7 +76,7 @@ automatically.
 
 The API is undocumented and may change. Authentication uses the public
 Supabase client key that ships with OrcaSlicer; no client secret or password is
-stored by this tool.
+stored by this tool. The listing description is limited to 10,000 characters.
 
 ## Token rotation
 

@@ -74,7 +74,8 @@ python3 plugin/dev/orca_hub.py update --description-file plugin/HUB_DESCRIPTION.
 
 The session is stored in `.secrets/orca_cloud.json`, which is ignored by git.
 It is separate from OrcaSlicer's own session and is not needed by the released
-plugin.
+plugin. Orca Cloud limits the listing description to 10,000 characters; keep
+`plugin/HUB_DESCRIPTION.md` below that limit.
 
 ## GitHub publishing
 
