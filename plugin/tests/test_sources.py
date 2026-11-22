@@ -10,14 +10,19 @@ used.
 from __future__ import annotations
 
 import dataclasses
+import http.server
+import inspect
 import json
+import ntpath
 import os
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
 import urllib.error
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -152,6 +157,21 @@ class ValueHelperTests(unittest.TestCase):
         self.assertIsNone(sources.safe_int(float("inf")))
         self.assertIsNone(sources.safe_int([1]))
 
+    def test_at_mapping_is_consistently_zero_or_one_based(self):
+        one_based = {"1": "A", "2": "B"}
+        self.assertEqual(sources._at(one_based, 0), "A")
+        self.assertEqual(sources._at(one_based, 1), "B")
+        self.assertIsNone(sources._at(one_based, 2))
+
+        zero_based = {"0": "A", "1": "B"}
+        self.assertEqual(sources._at(zero_based, 0), "A")
+        self.assertEqual(sources._at(zero_based, 1), "B")
+        self.assertIsNone(sources._at(zero_based, 2))
+
+        named = {"T1": "A", "T2": "B"}
+        self.assertEqual(sources._at(named, 0), "A")
+        self.assertEqual(sources._at(named, 1), "B")
+
     def test_normalize_color_hex_forms(self):
         cases = {
             "#ff0000": "#FF0000",
@@ -254,7 +274,7 @@ class SnapmakerTests(unittest.TestCase):
         self.assertEqual(first.raw["filament_type"], "PLA")
         self.assertEqual(first.raw["filament_detect"]["BED_TEMP"], 60)
 
-    def test_missing_exist_infers_presence(self):
+    def test_missing_exist_reports_no_slots(self):
         payload = {
             "result": {
                 "status": {
@@ -266,9 +286,7 @@ class SnapmakerTests(unittest.TestCase):
             }
         }
         observations = sources._parse_snapmaker(payload)
-        self.assertEqual([observation.slot for observation in observations], [1, 2])
-        self.assertTrue(all(observation.present for observation in observations))
-        self.assertEqual(observations[1].material, "PETG")
+        self.assertEqual(observations, [])
 
     def test_mapping_arrays_and_false_slot(self):
         payload = {
@@ -289,7 +307,7 @@ class SnapmakerTests(unittest.TestCase):
         self.assertFalse(observations[1].present)
         self.assertEqual(observations[1].material, "")
 
-    def test_scalar_exist_does_not_hide_other_slots(self):
+    def test_scalar_exist_reports_no_slots(self):
         payload = {
             "result": {
                 "status": {
@@ -301,8 +319,7 @@ class SnapmakerTests(unittest.TestCase):
             }
         }
         observations = sources._parse_snapmaker(payload)
-        self.assertEqual(len(observations), 3)
-        self.assertTrue(all(observation.present for observation in observations))
+        self.assertEqual(observations, [])
 
     def test_garbage_values_do_not_raise(self):
         payload = {
@@ -403,14 +420,14 @@ class MoonrakerTests(unittest.TestCase):
             "lane2": {"material": "PETG"},
         }
         observations = sources._parse_moonraker(top_level)
-        self.assertEqual([observation.slot for observation in observations], [1, 2])
-        self.assertEqual(observations[1].material, "PETG")
+        self.assertEqual(observations, [])
 
-    def test_t_prefixed_lane_is_zero_based(self):
+    def test_t_prefixed_and_numeric_lane_are_skipped(self):
         payload = {"result": {"value": {"laneT": {"lane": "T1", "material": "PLA"}}}}
         observations = sources._parse_moonraker(payload)
-        self.assertEqual(len(observations), 1)
-        self.assertEqual(observations[0].slot, 2)
+        self.assertEqual(observations, [])
+        numeric = {"result": {"value": {"lane1": {"lane": 0, "material": "PLA"}}}}
+        self.assertEqual(sources._parse_moonraker(numeric), [])
 
     def test_numeric_filament_id_and_zero_spool_are_ignored(self):
         payload = {
@@ -448,11 +465,9 @@ class MoonrakerTests(unittest.TestCase):
             [],
         )
         spool_only = sources._parse_moonraker(
-            {"result": {"value": {"lane1": {"material": "", "spool_id": 12}}}}
+            {"result": {"value": {"lane1": {"lane": "0", "material": "", "spool_id": 12}}}}
         )
-        self.assertEqual(len(spool_only), 1)
-        self.assertEqual(spool_only[0].spool_id, 12)
-        self.assertEqual(spool_only[0].material, "")
+        self.assertEqual(spool_only, [])
 
 
 class MergeAndReadPrinterTests(unittest.TestCase):
@@ -633,6 +648,41 @@ class MergeAndReadPrinterTests(unittest.TestCase):
             observations, errors = sources.read_printer("http://printer.local")
         self.assertEqual(observations, [])
         self.assertEqual(errors, ["no filament slots reported by Snapmaker or Moonraker"])
+
+    def test_read_printer_public_signature_matches_entry_calls(self):
+        parameters = inspect.signature(sources.read_printer).parameters
+        self.assertEqual(
+            list(parameters),
+            ["base_url", "api_key", "timeout", "port", "agent"],
+        )
+
+        calls = []
+
+        def fake(url, timeout=None, headers=None):
+            calls.append(url)
+            return load_bytes("snapmaker_response.json")
+
+        with mock.patch.object(sources, "_open_url", fake):
+            # The entry worker calls reader(url, api_key, timeout=...).
+            observations, errors = sources.read_printer(
+                "printer.local", "secret", timeout=3.0
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(len(observations), 4)
+            # The optional agent/port keywords must not raise a TypeError.
+            observations, errors = sources.read_printer(
+                "printer.local",
+                "secret",
+                timeout=3.0,
+                port=7126,
+                agent="snapmaker",
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(len(observations), 4)
+        self.assertTrue(calls[0].startswith("http://printer.local/"))
+        self.assertTrue(
+            any(url.startswith("http://printer.local:7126/") for url in calls)
+        )
 
     def test_read_printer_without_url(self):
         observations, errors = sources.read_printer("")
@@ -981,12 +1031,12 @@ class OfdTests(unittest.TestCase):
     def test_cache_is_written_atomically_and_reused(self):
         library = self.make_library()
         candidates = library.find("Polymaker", "PLA", "PolyLite PLA")
-        self.assertTrue(os.path.exists(self.cache_path))
+        self.assertTrue(os.path.exists(library.cache_path))
         self.assertEqual(
-            json.loads(Path(self.cache_path).read_text(encoding="utf-8"))["profiles"],
+            json.loads(Path(library.cache_path).read_text(encoding="utf-8"))["profiles"],
             self.index["profiles"],
         )
-        leftovers = list(Path(self.cache_path).parent.glob(".ofd-index-*.tmp"))
+        leftovers = list(Path(library.cache_path).parent.glob(".ofd-index-*.tmp"))
         self.assertEqual(leftovers, [])
 
         offline_calls = []
@@ -1040,7 +1090,7 @@ class OfdTests(unittest.TestCase):
         library = self.make_library()
         library.find("Polymaker", "PLA", "PolyLite PLA")
         old = time.time() - (sources.DEFAULT_OFD_CACHE_TTL * 2)
-        os.utime(self.cache_path, (old, old))
+        os.utime(library.cache_path, (old, old))
 
         def offline(url):
             raise urllib.error.URLError("offline")
@@ -1079,7 +1129,7 @@ class OfdTests(unittest.TestCase):
         )
         with self.assertRaises(sources.SourceError):
             library.find("Polymaker", "PLA", "PolyLite PLA")
-        self.assertFalse(os.path.exists(self.cache_path))
+        self.assertFalse(os.path.exists(library.cache_path))
 
         malformed = sources.OfdLibrary(
             cache_path=self.cache_path,
@@ -1087,7 +1137,7 @@ class OfdTests(unittest.TestCase):
         )
         with self.assertRaises(sources.SourceError):
             malformed.find("Polymaker", "PLA", "PolyLite PLA")
-        self.assertFalse(os.path.exists(self.cache_path))
+        self.assertFalse(os.path.exists(malformed.cache_path))
 
     def test_list_index_is_accepted(self):
         library = sources.OfdLibrary(
@@ -1114,8 +1164,20 @@ class OfdTests(unittest.TestCase):
             sources.OfdLibrary.validate_preset({k: v for k, v in valid.items() if k != "inherits"}),
         )
         self.assertIn(
-            "system-only key present: filament_id",
-            sources.OfdLibrary.validate_preset({**valid, "filament_id": "OFDSrzZ8"}),
+            "system-only key present: filament_ids",
+            sources.OfdLibrary.validate_preset({**valid, "filament_ids": ["OFDSrzZ8"]}),
+        )
+        self.assertEqual(
+            sources.OfdLibrary.validate_preset({**valid, "filament_id": "USERPLA"}),
+            [],
+        )
+        self.assertIn(
+            "not a filament preset",
+            sources.OfdLibrary.validate_preset({**valid, "type": "process"}),
+        )
+        self.assertEqual(
+            sources.OfdLibrary.validate_preset({**valid, "type": "filament"}),
+            [],
         )
         self.assertTrue(sources.OfdLibrary.validate_preset([]))
 
@@ -1133,7 +1195,7 @@ class OfdTests(unittest.TestCase):
         )
         library.find("Polymaker", "PLA", "PolyLite PLA")
         library.find("Polymaker", "PLA", "PolyLite PLA")
-        self.assertEqual(len(calls), 1)  # in-memory index still wins in one process
+        self.assertEqual(len(calls), 2)  # memory hits also honour the TTL
 
         second = sources.OfdLibrary(
             cache_path=self.cache_path,
@@ -1141,7 +1203,945 @@ class OfdTests(unittest.TestCase):
             opener=opener,
         )
         second.find("Polymaker", "PLA", "PolyLite PLA")
-        self.assertEqual(len(calls), 2)  # cache is never considered fresh
+        self.assertEqual(len(calls), 3)  # cache is never considered fresh
+
+
+class UrlAndSpoolmanNormalizationTests(unittest.TestCase):
+    def test_normalize_base_url_ipv6_and_configured_port(self):
+        self.assertEqual(sources.normalize_base_url("fd00::1"), "http://[fd00::1]")
+        self.assertEqual(
+            sources.normalize_base_url("[fd00::1]"),
+            "http://[fd00::1]",
+        )
+        self.assertEqual(
+            sources.normalize_base_url("[fd00::1]:7912"),
+            "http://[fd00::1]:7912",
+        )
+        self.assertEqual(
+            sources.normalize_base_url("fd00::1:7125"),
+            "http://[fd00::1]:7125",
+        )
+        self.assertEqual(
+            sources.normalize_base_url("2001:db8::1"),
+            "http://[2001:db8::1]",
+        )
+        self.assertEqual(
+            sources.normalize_base_url("2001:db8:0:0:0:0:0:1"),
+            "http://[2001:db8:0:0:0:0:0:1]",
+        )
+        self.assertEqual(
+            sources.normalize_base_url("http://fd00::1"),
+            "http://[fd00::1]",
+        )
+        self.assertEqual(
+            sources.normalize_base_url("printer.local:7912"),
+            "http://printer.local:7912",
+        )
+        self.assertEqual(
+            sources.normalize_base_url("printer.local", port=7126),
+            "http://printer.local:7126",
+        )
+        self.assertEqual(
+            sources.normalize_base_url("[fd00::1]", port=7126),
+            "http://[fd00::1]:7126",
+        )
+
+    def test_spoolman_url_strips_api_v1_and_brackets_ipv6(self):
+        self.assertEqual(
+            sources.normalize_spoolman_url("http://spoolman:8000/api/v1"),
+            "http://spoolman:8000",
+        )
+        self.assertEqual(
+            sources.normalize_spoolman_url("http://spoolman:8000/api/v1/"),
+            "http://spoolman:8000",
+        )
+        self.assertEqual(
+            sources.normalize_spoolman_url("spoolman:8000/api/v1"),
+            "http://spoolman:8000",
+        )
+        self.assertEqual(
+            sources.normalize_spoolman_url("fd00::1"),
+            "http://[fd00::1]",
+        )
+
+        client = sources.SpoolmanClient("http://spoolman:8000/api/v1/")
+        self.assertEqual(client.base_url, "http://spoolman:8000")
+        calls = []
+        client = sources.SpoolmanClient(
+            "http://spoolman:8000/api/v1",
+            opener=lambda url: calls.append(url) or {"id": 1},
+        )
+        client.get_spool(1)
+        self.assertEqual(calls, ["http://spoolman:8000/api/v1/spool/1"])
+
+    def test_spoolman_ipv6_client_path(self):
+        calls = []
+        client = sources.SpoolmanClient(
+            "[fd00::1]:8000/api/v1",
+            opener=lambda url: calls.append(url) or {"id": 1},
+        )
+        client.get_spool(1)
+        self.assertEqual(calls, ["http://[fd00::1]:8000/api/v1/spool/1"])
+
+
+class NativeSnapmakerTests(unittest.TestCase):
+    def test_native_arrays_and_optional_temperatures(self):
+        observations = sources._parse_snapmaker(
+            load_json("snapmaker_native_response.json")
+        )
+        self.assertEqual(
+            [observation.slot for observation in observations], [1, 2, 3, 4]
+        )
+        first, second, third, fourth = observations
+
+        self.assertTrue(first.present)
+        self.assertEqual(first.material, "PLA")
+        self.assertEqual(first.subtype, "CF")
+        self.assertEqual(first.vendor, "Acme")
+        self.assertEqual(first.color, "#112233")
+        self.assertEqual(first.bed_temp, 60)
+        self.assertEqual(first.nozzle_temp, 230)
+        self.assertEqual(first.raw["tray_type"], "PLA-CF")
+
+        self.assertFalse(second.present)
+        self.assertEqual(second.material, "")
+        self.assertEqual(second.vendor, "")
+
+        self.assertTrue(third.present)
+        self.assertEqual(third.material, "PLA")
+        self.assertEqual(third.subtype, "SnapSpeed")
+        self.assertEqual(third.color, "#AABBCC")
+        self.assertIsNone(third.bed_temp)
+
+        self.assertFalse(fourth.present)
+        self.assertIsNone(fourth.bed_temp)
+        self.assertIsNone(fourth.nozzle_temp)
+
+    def test_slot_count_comes_from_filament_exist_only(self):
+        payload = {
+            "result": {
+                "status": {
+                    "print_task_config": {
+                        "filament_exist": [True, False],
+                        "filament_type": ["PLA", "PETG", "ABS"],
+                        "filament_color_rgba": ["#FF0000", "#00FF00", "#0000FF"],
+                    }
+                }
+            }
+        }
+        observations = sources._parse_snapmaker(payload)
+        self.assertEqual(len(observations), 2)
+        self.assertEqual(observations[0].material, "PLA")
+        self.assertFalse(observations[1].present)
+
+    def test_missing_or_empty_filament_exist_reports_no_slots(self):
+        self.assertEqual(
+            sources._parse_snapmaker(
+                {"result": {"status": {"print_task_config": {
+                    "filament_type": ["PLA", "PETG"],
+                }}}}
+            ),
+            [],
+        )
+        self.assertEqual(
+            sources._parse_snapmaker(
+                {"result": {"status": {"print_task_config": {
+                    "filament_exist": [],
+                    "filament_type": ["PLA"],
+                }}}}
+            ),
+            [],
+        )
+
+    def test_snapmaker_endpoint_is_native(self):
+        calls = []
+
+        def fake(url, timeout=None, headers=None):
+            calls.append((url, dict(headers or {})))
+            return load_bytes("snapmaker_native_response.json")
+
+        with mock.patch.object(sources, "_open_url", fake):
+            observations = sources._read_snapmaker(
+                "http://printer.local:7126", "secret", 2
+            )
+        self.assertEqual(len(observations), 4)
+        self.assertEqual(
+            calls[0][0],
+            "http://printer.local:7126/printer/objects/query"
+            "?print_task_config&filament_detect",
+        )
+        self.assertEqual(calls[0][1]["X-Api-Key"], "secret")
+
+
+class NativeMoonrakerTests(unittest.TestCase):
+    def test_lane_data_uses_string_lane_and_ignores_object_keys(self):
+        observations = sources._parse_moonraker(
+            load_json("moonraker_lane_data_native.json")
+        )
+        self.assertEqual(
+            [observation.slot for observation in observations], [1, 4]
+        )
+
+        first, fourth = observations
+        self.assertEqual(first.material, "PLA")
+        self.assertEqual(first.color, "#FF0000")
+        self.assertEqual(first.filament_id, "OFDPLA")
+        self.assertEqual(first.bed_temp, 60)
+        self.assertEqual(first.nozzle_temp, 210)
+
+        self.assertEqual(fourth.slot, 4)
+        self.assertEqual(fourth.material, "ABS")
+        self.assertEqual(fourth.vendor, "Acme")
+        self.assertEqual(fourth.spool_id, 7)
+        self.assertEqual(fourth.filament_id, "")
+
+    def test_numeric_lane_and_key_based_fallbacks_are_not_used(self):
+        payload = {
+            "result": {
+                "value": {
+                    "lane1": {"lane": 0, "material": "PLA"},
+                    "lane2": {"material": "PETG"},
+                    "lane3": {"lane": "1", "material": "ABS"},
+                }
+            }
+        }
+        observations = sources._parse_moonraker(payload)
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0].slot, 2)
+        self.assertEqual(observations[0].material, "ABS")
+
+        disagree = {
+            "result": {
+                "value": {
+                    "0": {"lane": "1", "material": "PLA"},
+                    "3": {"lane": "0", "material": "PETG"},
+                }
+            }
+        }
+        observations = sources._parse_moonraker(disagree)
+        self.assertEqual([observation.slot for observation in observations], [1, 2])
+        self.assertEqual(
+            [observation.material for observation in observations], ["PETG", "PLA"]
+        )
+
+    def test_lane_without_material_is_skipped_even_with_spool(self):
+        payload = {
+            "result": {
+                "value": {
+                    "lane1": {"lane": "0", "material": "", "spool_id": 12},
+                    "lane2": {"lane": "1", "material": "PLA"},
+                }
+            }
+        }
+        observations = sources._parse_moonraker(payload)
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0].slot, 2)
+
+    def test_happy_hare_gate_parsing(self):
+        payload = load_json("moonraker_mmu.json")
+        observations = sources._parse_happy_hare(payload)
+        self.assertEqual([observation.slot for observation in observations], [1, 2])
+        first, second = observations
+        self.assertEqual(first.material, "PLA")
+        self.assertEqual(first.color, "#FF0000")
+        self.assertEqual(first.nozzle_temp, 210)
+        self.assertEqual(first.bed_temp, 0)
+        self.assertTrue(first.present)
+        self.assertEqual(second.material, "PETG")
+        self.assertEqual(second.nozzle_temp, 240)
+
+        # `_parse_moonraker` recognises the native Happy Hare shape too.
+        self.assertEqual(
+            [observation.slot for observation in sources._parse_moonraker(payload)],
+            [1, 2],
+        )
+
+    def test_happy_hare_missing_arrays_reports_nothing(self):
+        self.assertEqual(
+            sources._parse_happy_hare(
+                {"result": {"status": {"mmu": {"num_gates": 4}}}}
+            ),
+            [],
+        )
+        self.assertEqual(
+            sources._parse_happy_hare(
+                {"result": {"status": {"mmu": {}}}}
+            ),
+            [],
+        )
+
+    def test_creality_cfs_box_mapping(self):
+        payload = load_json("creality_cfs_box.json")
+        observations = sources._parse_creality_cfs(payload)
+        self.assertEqual(
+            [observation.slot for observation in observations],
+            [1, 2, 4, 9, 10, 11, 12],
+        )
+        by_slot = {observation.slot: observation for observation in observations}
+        self.assertEqual(by_slot[1].material, "PLA")
+        self.assertEqual(by_slot[1].color, "#FF0000")
+        self.assertEqual(by_slot[1].subtype, "")
+        self.assertEqual(by_slot[2].material, "PLA")
+        self.assertEqual(by_slot[2].subtype, "Silk")
+        self.assertEqual(by_slot[2].color, "#00FF00")
+        self.assertEqual(by_slot[4].material, "PETG")
+        self.assertEqual(by_slot[4].color, "#ABCDEF")
+        self.assertEqual(by_slot[9].material, "TPU")
+        self.assertEqual(by_slot[9].subtype, "")
+        self.assertEqual(by_slot[10].material, "PLA")
+        self.assertEqual(by_slot[10].subtype, "CF")
+        self.assertEqual(by_slot[11].material, "PETG")
+        self.assertEqual(by_slot[11].subtype, "CF")
+        self.assertEqual(by_slot[12].material, "PA")
+        self.assertEqual(by_slot[12].subtype, "CF")
+        self.assertEqual(by_slot[10].raw["tray_type"], "PLA-CF")
+        self.assertEqual(by_slot[2].raw["tray_type"], "PLA Silk")
+        self.assertTrue(all(observation.present for observation in observations))
+
+        self.assertEqual(
+            [observation.slot for observation in sources._parse_moonraker(payload)],
+            [1, 2, 4, 9, 10, 11, 12],
+        )
+
+    def test_moonraker_native_fallback_order(self):
+        class FakeHTTP:
+            def __init__(self, responses):
+                self.responses = responses
+                self.calls = []
+
+            def __call__(self, url, timeout=None, headers=None):
+                self.calls.append(url)
+                for suffix, value in self.responses.items():
+                    if suffix in url:
+                        if isinstance(value, BaseException):
+                            raise value
+                        return value
+                raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+
+        lane_payload = load_json("moonraker_lane_data.json")
+        mmu_payload = load_json("moonraker_mmu.json")
+        box_payload = load_json("creality_cfs_box.json")
+
+        lane = FakeHTTP({"namespace=lane_data": lane_payload})
+        with mock.patch.object(sources, "_open_url", lane):
+            observations, errors = sources.read_printer(
+                "http://printer.local", agent="moonraker"
+            )
+        self.assertEqual(errors, [])
+        self.assertEqual(len(lane.calls), 1)
+        self.assertIn("namespace=lane_data", lane.calls[0])
+        self.assertEqual(len(observations), 4)
+
+        not_found = urllib.error.HTTPError("http://printer.local", 404, "No", {}, None)
+        mmu = FakeHTTP({
+            "namespace=lane_data": not_found,
+            "objects/query?mmu": mmu_payload,
+        })
+        with mock.patch.object(sources, "_open_url", mmu):
+            observations, errors = sources.read_printer(
+                "http://printer.local", agent="moonraker"
+            )
+        self.assertEqual(errors, [])
+        self.assertEqual(len(mmu.calls), 2)
+        self.assertIn("objects/query?mmu", mmu.calls[1])
+        self.assertEqual([observation.slot for observation in observations], [1, 2])
+
+        box = FakeHTTP({
+            "namespace=lane_data": not_found,
+            "objects/query?mmu": not_found,
+            "objects/query?box": box_payload,
+        })
+        with mock.patch.object(sources, "_open_url", box):
+            observations, errors = sources.read_printer(
+                "http://printer.local", agent="moonraker"
+            )
+        self.assertEqual(errors, [])
+        self.assertEqual(len(box.calls), 3)
+        self.assertIn("objects/query?box", box.calls[2])
+        self.assertEqual(
+            [observation.slot for observation in observations],
+            [1, 2, 4, 9, 10, 11, 12],
+        )
+
+    def test_printer_port_is_configured_not_probed(self):
+        calls = []
+
+        def fake(url, timeout=None, headers=None):
+            calls.append(url)
+            return load_json("snapmaker_native_response.json")
+
+        with mock.patch.object(sources, "_open_url", fake):
+            observations, errors = sources.read_printer(
+                "printer.local", port=7126, agent="snapmaker"
+            )
+        self.assertEqual(errors, [])
+        self.assertEqual(len(observations), 4)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0].startswith("http://printer.local:7126/"))
+
+
+class MaterialVariantTests(unittest.TestCase):
+    def test_snapmaker_combined_material_exposes_family_and_subtype(self):
+        payload = {
+            "result": {
+                "status": {
+                    "print_task_config": {
+                        "filament_exist": [True, True, True, True],
+                        "filament_type": ["PLA-CF", "PLA", "PLA", "TPU-95A"],
+                        "filament_sub_type": ["", "", "CF", ""],
+                        "filament_color_rgba": [
+                            "#112233", "#445566", "#778899", "#AABBCC",
+                        ],
+                    }
+                }
+            }
+        }
+        observations = sources._parse_snapmaker(payload)
+        self.assertEqual(
+            [observation.material for observation in observations],
+            ["PLA", "PLA", "PLA", "TPU"],
+        )
+        self.assertEqual(
+            [observation.subtype for observation in observations],
+            ["CF", "", "CF", "95A"],
+        )
+        self.assertEqual(
+            [observation.raw["tray_type"] for observation in observations],
+            ["PLA-CF", "PLA", "PLA-CF", "TPU-95A"],
+        )
+
+    def test_moonraker_combined_material_exposes_family_and_subtype(self):
+        payload = {
+            "result": {
+                "value": {
+                    "lane1": {"lane": "0", "material": "PLA-CF"},
+                    "lane2": {"lane": "1", "material": "PLA"},
+                }
+            }
+        }
+        observations = sources._parse_moonraker(payload)
+        self.assertEqual(
+            [observation.material for observation in observations],
+            ["PLA", "PLA"],
+        )
+        self.assertEqual(
+            [observation.subtype for observation in observations],
+            ["CF", ""],
+        )
+        self.assertEqual(
+            [observation.raw["tray_type"] for observation in observations],
+            ["PLA-CF", "PLA"],
+        )
+
+    def test_happy_hare_combined_material_exposes_family_and_subtype(self):
+        payload = {
+            "result": {
+                "status": {
+                    "mmu": {
+                        "num_gates": 2,
+                        "gate_status": [1, 1],
+                        "gate_material": ["PLA-CF", "PLA"],
+                        "gate_color": ["#112233", "#445566"],
+                        "gate_temperature": [210, 210],
+                    }
+                }
+            }
+        }
+        observations = sources._parse_happy_hare(payload)
+        self.assertEqual(
+            [observation.material for observation in observations],
+            ["PLA", "PLA"],
+        )
+        self.assertEqual(
+            [observation.subtype for observation in observations],
+            ["CF", ""],
+        )
+        self.assertEqual(
+            [observation.raw["tray_type"] for observation in observations],
+            ["PLA-CF", "PLA"],
+        )
+
+    def test_creality_combined_material_exposes_family_and_subtype(self):
+        payload = {
+            "result": {
+                "status": {
+                    "box": {
+                        "T1": {
+                            "state": "connect",
+                            "material_type": ["000008", "000001", "000009", "000010"],
+                            "color_value": ["112233", "445566", "778899", "AABBCC"],
+                        }
+                    }
+                }
+            }
+        }
+        observations = sources._parse_creality_cfs(payload)
+        self.assertEqual(
+            [observation.material for observation in observations],
+            ["PLA", "PLA", "PETG", "PA"],
+        )
+        self.assertEqual(
+            [observation.subtype for observation in observations],
+            ["CF", "", "CF", "CF"],
+        )
+        self.assertEqual(
+            [observation.raw["tray_type"] for observation in observations],
+            ["PLA-CF", "PLA", "PETG-CF", "PA-CF"],
+        )
+
+
+class OfdCacheRegressionTests(unittest.TestCase):
+    def setUp(self):
+        self.index_bytes = load_bytes("ofd_index.json")
+        self.preset_bytes = load_bytes("ofd_preset.json")
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.cache_path = os.path.join(self.temp_dir.name, "ofd_index.json")
+
+    def test_memory_cache_honours_ttl(self):
+        calls = []
+        now = [1000.0]
+
+        def opener(url):
+            calls.append(url)
+            return self.index_bytes
+
+        def clock():
+            return now[0]
+
+        with mock.patch.object(sources.time, "time", clock):
+            library = sources.OfdLibrary(
+                "https://example.test/index.json",
+                cache_path=None,
+                cache_ttl=10,
+                opener=opener,
+            )
+            library.find("Polymaker", "PLA", "PolyLite PLA")
+            now[0] = 1005.0
+            library.find("Polymaker", "PLA", "PolyLite PLA")
+            self.assertEqual(len(calls), 1)
+            now[0] = 1011.0
+            library.find("Polymaker", "PLA", "PolyLite PLA")
+            self.assertEqual(len(calls), 2)
+
+    def test_cache_is_scoped_by_index_url(self):
+        index_a = {
+            "profiles": [{
+                "brand": "BrandA", "material": "PLA", "filament": "A PLA",
+                "profile_name": "BrandA A PLA (OFD)",
+                "path": "brands/a/pla.json",
+            }]
+        }
+        index_b = {
+            "profiles": [{
+                "brand": "BrandB", "material": "PLA", "filament": "B PLA",
+                "profile_name": "BrandB B PLA (OFD)",
+                "path": "brands/b/pla.json",
+            }]
+        }
+
+        def opener(payload):
+            return lambda url: payload
+
+        library_a = sources.OfdLibrary(
+            "https://a.example/index.json",
+            self.cache_path,
+            opener=opener(index_a),
+        )
+        library_b = sources.OfdLibrary(
+            "https://b.example/index.json",
+            self.cache_path,
+            opener=opener(index_b),
+        )
+        self.assertNotEqual(library_a.cache_path, library_b.cache_path)
+        self.assertEqual(
+            [item["brand"] for item in library_a.find("BrandA", "PLA", "A PLA")],
+            ["BrandA"],
+        )
+        self.assertEqual(
+            [item["brand"] for item in library_b.find("BrandB", "PLA", "B PLA")],
+            ["BrandB"],
+        )
+
+        def offline(url):
+            raise urllib.error.URLError("offline")
+
+        again_a = sources.OfdLibrary(
+            "https://a.example/index.json", self.cache_path, opener=offline
+        )
+        self.assertEqual(
+            [item["brand"] for item in again_a.find("BrandA", "PLA", "A PLA")],
+            ["BrandA"],
+        )
+
+    def test_refresh_clears_memory_and_disk_preset_cache(self):
+        preset_dir = os.path.join(self.temp_dir.name, "presets")
+        calls = []
+
+        def opener(url):
+            calls.append(url)
+            if url.endswith("/index.json"):
+                return self.index_bytes
+            return self.preset_bytes
+
+        library = sources.OfdLibrary(
+            "https://example.test/index.json",
+            self.cache_path,
+            preset_cache_dir=preset_dir,
+            opener=opener,
+        )
+        candidate = library.find("Polymaker", "PLA", "PolyLite PLA")[0]
+        library.fetch(candidate)
+        self.assertTrue(list(Path(preset_dir).rglob("*.json")))
+        self.assertTrue(library._presets)
+
+        library.refresh()
+        self.assertEqual(library._presets, {})
+        self.assertEqual(list(Path(preset_dir).rglob("*.json")), [])
+        calls_before = len(calls)
+        library.fetch(candidate)
+        self.assertGreater(len(calls), calls_before)
+
+    def test_invalid_cached_preset_is_refetched(self):
+        preset_dir = os.path.join(self.temp_dir.name, "presets")
+        calls = []
+
+        def opener(url):
+            calls.append(url)
+            if url.endswith("/index.json"):
+                return self.index_bytes
+            return self.preset_bytes
+
+        library = sources.OfdLibrary(
+            "https://example.test/index.json",
+            self.cache_path,
+            preset_cache_dir=preset_dir,
+            opener=opener,
+        )
+        candidate = library.find("Polymaker", "PLA", "PolyLite PLA")[0]
+        library.fetch(candidate)
+        cache_file = Path(library._preset_cache_path(candidate["path"]))
+        self.assertTrue(cache_file.exists())
+        cache_file.write_text("{}", encoding="utf-8")
+        preset_calls = [url for url in calls if "polylite_pla" in url]
+        self.assertEqual(len(preset_calls), 1)
+
+        second = sources.OfdLibrary(
+            "https://example.test/index.json",
+            self.cache_path,
+            preset_cache_dir=preset_dir,
+            opener=opener,
+        )
+        second.find("Polymaker", "PLA", "PolyLite PLA")
+        preset = second.fetch(candidate)
+        self.assertEqual(preset["name"], "Polymaker PolyLite PLA (OFD)")
+        preset_calls = [url for url in calls if "polylite_pla" in url]
+        self.assertEqual(len(preset_calls), 2)
+
+    def test_refresh_retries_after_zero_ttl(self):
+        calls = []
+
+        def opener(url):
+            calls.append(url)
+            return self.index_bytes
+
+        library = sources.OfdLibrary(
+            "https://example.test/index.json",
+            self.cache_path,
+            cache_ttl=0,
+            opener=opener,
+        )
+        library.find("Polymaker", "PLA", "PolyLite PLA")
+        library.find("Polymaker", "PLA", "PolyLite PLA")
+        self.assertEqual(len(calls), 2)
+
+
+class SpoolmanExtraRegressionTests(unittest.TestCase):
+    def test_find_filament_by_extra_paginates(self):
+        records = [
+            {"id": index, "extra": {}}
+            for index in range(1, 101)
+        ]
+        records.append({
+            "id": 999,
+            "extra": {"orca_preset": json.dumps("Target Preset")},
+        })
+        queries = []
+
+        def opener(url):
+            parts = urllib.parse.urlsplit(url)
+            query = urllib.parse.parse_qs(parts.query)
+            queries.append((parts.path, dict(query)))
+            if parts.path != "/api/v1/filament":
+                raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+            offset = int(query.get("offset", ["0"])[0])
+            limit = int(query.get("limit", ["100"])[0])
+            return records[offset:offset + limit]
+
+        client = sources.SpoolmanClient(
+            "http://spoolman:8000/api/v1", opener=opener
+        )
+        found = client.find_filament_by_extra("orca_preset", "Target Preset")
+        self.assertIsNotNone(found)
+        self.assertEqual(found["id"], 999)
+        self.assertGreaterEqual(len(queries), 2)
+        self.assertTrue(any(query.get("offset") == ["100"] for _, query in queries))
+
+    def test_find_filament_by_extra_is_type_aware(self):
+        record = {
+            "id": 5,
+            "extra": {
+                "count": 5,
+                "flag": True,
+                "name": json.dumps("5"),
+            },
+        }
+        client = sources.SpoolmanClient(
+            "http://spoolman:8000",
+            opener=lambda url: [record],
+        )
+        self.assertEqual(
+            client.find_filament_by_extra("count", 5)["id"], 5
+        )
+        self.assertIsNone(client.find_filament_by_extra("count", "5"))
+        self.assertEqual(
+            client.find_filament_by_extra("flag", True)["id"], 5
+        )
+        self.assertIsNone(client.find_filament_by_extra("flag", "True"))
+        self.assertEqual(
+            client.find_filament_by_extra("name", "5")["id"], 5
+        )
+
+    def test_extra_decoding_handles_bytes_and_wrappers(self):
+        self.assertEqual(
+            sources.SpoolmanClient.decode_extra_value(b'"Matte"'), "Matte"
+        )
+        self.assertEqual(
+            sources.SpoolmanClient.decode_extra_value(
+                {"value": {"value": json.dumps("Matte")}}
+            ),
+            "Matte",
+        )
+        self.assertEqual(
+            sources.SpoolmanClient.decode_extra(
+                {"x": {"value": json.dumps(3)}, "bad": "{"}
+            ),
+            {"x": 3, "bad": "{"},
+        )
+
+
+class OfdLocalAndValidationTests(unittest.TestCase):
+    def test_windows_local_index_uses_ntpath_join(self):
+        index_path = r"C:\Users\tester\ofd\index.json"
+        library = sources.OfdLibrary(index_path, cache_path=None)
+        self.assertTrue(library._local_index)
+        self.assertEqual(
+            library._preset_url("brands/acme/pla.json"),
+            ntpath.join(
+                r"C:\Users\tester\ofd",
+                *"brands/acme/pla.json".split("/"),
+            ),
+        )
+
+    def test_posix_local_index_still_resolves(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "index.json").write_bytes(load_bytes("ofd_index.json"))
+            preset_path = root / "brands/polymaker/materials/PLA/filaments"
+            preset_path.mkdir(parents=True)
+            (preset_path / "polylite_pla.json").write_bytes(
+                load_bytes("ofd_preset.json")
+            )
+            library = sources.OfdLibrary(str(root / "index.json"), cache_path=None)
+            candidate = library.find("Polymaker", "PLA", "PolyLite PLA")[0]
+            self.assertEqual(library.fetch(candidate)["name"],
+                             "Polymaker PolyLite PLA (OFD)")
+
+    def test_validate_rejects_non_filament_type(self):
+        valid = load_json("ofd_preset.json")
+        self.assertEqual(
+            sources.OfdLibrary.validate_preset({**valid, "type": "filament"}),
+            [],
+        )
+        self.assertIn(
+            "not a filament preset",
+            sources.OfdLibrary.validate_preset({**valid, "type": "process"}),
+        )
+        self.assertEqual(
+            sources.OfdLibrary.validate_preset({**valid, "filament_id": "USERPLA"}),
+            [],
+        )
+
+    def test_concurrent_find_is_safe(self):
+        library = sources.OfdLibrary(
+            "https://example.test/index.json",
+            cache_path=None,
+            opener=lambda url: load_bytes("ofd_index.json"),
+        )
+        results = []
+        errors = []
+
+        def worker():
+            try:
+                for _ in range(10):
+                    results.append(
+                        len(library.find("Polymaker", "PLA", "PolyLite PLA"))
+                    )
+            except Exception as error:  # pragma: no cover - failure detail
+                errors.append(error)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [2] * 40)
+
+
+class _NetworkHandler(http.server.BaseHTTPRequestHandler):
+    attempts = 0
+    target_headers: list[dict[str, str]] = []
+
+    def log_message(self, *args):
+        pass
+
+    def _send(self, body=b"", status=200, headers=None):
+        self.send_response(status)
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/redirect":
+            self._send(
+                status=302,
+                headers={"Location": self.server.target_url},
+            )
+            return
+        if self.path == "/same-start":
+            self._send(status=302, headers={"Location": "/target"})
+            return
+        if self.path == "/retry":
+            type(self).attempts += 1
+            if type(self).attempts == 1:
+                self._send(b"busy", status=503)
+                return
+            self._send(b"ok")
+            return
+        if self.path == "/target":
+            type(self).target_headers.append(dict(self.headers))
+            self._send(b"target")
+            return
+        self._send(b"ok")
+
+
+class NetworkHardeningTests(unittest.TestCase):
+    def setUp(self):
+        self.server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), _NetworkHandler
+        )
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, daemon=True
+        )
+        self.thread.start()
+        self.base = "http://127.0.0.1:%d" % self.server.server_address[1]
+        self.addCleanup(self._stop)
+
+    def _stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def test_loopback_request_bypasses_environment_proxy(self):
+        proxy = "http://127.0.0.1:1"
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HTTP_PROXY": proxy,
+                "HTTPS_PROXY": proxy,
+                "http_proxy": proxy,
+                "https_proxy": proxy,
+                "NO_PROXY": "",
+                "no_proxy": "",
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                sources._open_url(self.base + "/plain", timeout=2),
+                b"ok",
+            )
+
+    def test_cross_origin_redirect_strips_auth_headers(self):
+        target = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), _NetworkHandler
+        )
+        target_thread = threading.Thread(
+            target=target.serve_forever, daemon=True
+        )
+        target_thread.start()
+        try:
+            self.server.target_url = (
+                "http://127.0.0.1:%d/target" % target.server_address[1]
+            )
+            _NetworkHandler.target_headers = []
+            body = sources._open_url(
+                self.base + "/redirect",
+                timeout=2,
+                headers={
+                    "X-Api-Key": "secret",
+                    "Authorization": "Bearer secret",
+                },
+            )
+            self.assertEqual(body, b"target")
+            self.assertEqual(len(_NetworkHandler.target_headers), 1)
+            headers = {
+                key.casefold(): value
+                for key, value in _NetworkHandler.target_headers[0].items()
+            }
+            self.assertNotIn("x-api-key", headers)
+            self.assertNotIn("authorization", headers)
+        finally:
+            target.shutdown()
+            target.server_close()
+            target_thread.join(timeout=2)
+
+    def test_same_origin_redirect_keeps_auth_headers(self):
+        _NetworkHandler.target_headers = []
+        body = sources._open_url(
+            self.base + "/same-start",
+            timeout=2,
+            headers={"X-Api-Key": "secret"},
+        )
+        self.assertEqual(body, b"target")
+        headers = {
+            key.casefold(): value
+            for key, value in _NetworkHandler.target_headers[0].items()
+        }
+        self.assertEqual(headers.get("x-api-key"), "secret")
+
+    def test_transient_failure_is_retried_once(self):
+        _NetworkHandler.attempts = 0
+        self.assertEqual(
+            sources._open_url(self.base + "/retry", timeout=2),
+            b"ok",
+        )
+        self.assertEqual(_NetworkHandler.attempts, 2)
+
+    def test_timeouts_are_finite(self):
+        self.assertEqual(
+            sources._coerce_timeout(float("inf")), sources.DEFAULT_TIMEOUT
+        )
+        self.assertEqual(
+            sources._coerce_timeout(None), sources.DEFAULT_TIMEOUT
+        )
+        self.assertEqual(
+            sources._coerce_timeout(-1), sources.DEFAULT_TIMEOUT
+        )
+        self.assertEqual(sources._coerce_timeout(2), 2)
 
 
 if __name__ == "__main__":

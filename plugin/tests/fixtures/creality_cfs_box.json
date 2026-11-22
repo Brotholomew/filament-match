@@ -1,0 +1,26 @@
+{
+  "result": {
+    "status": {
+      "box": {
+        "T1": {
+          "state": "connect",
+          "material_type": ["000001", "005001", "", "000003"],
+          "color_value": ["0FF0000", "00FF00", "123456", "0xABCDEF"]
+        },
+        "T2": {
+          "state": "disconnect",
+          "material_type": ["000002", "000002", "000002", "000002"],
+          "color_value": ["111111", "222222", "333333", "444444"]
+        },
+        "T3": {
+          "state": "connect",
+          "material_type": ["000004", "000008", "000009", "000010"],
+          "color_value": ["FF0000", "00FF00", "0000FF", "112233"]
+        },
+        "same_material": [
+          ["005001", "#FF0000", [0], "PLA Silk"]
+        ]
+      }
+    }
+  }
+}

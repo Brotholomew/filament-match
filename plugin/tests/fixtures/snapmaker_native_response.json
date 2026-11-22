@@ -1,0 +1,21 @@
+{
+  "result": {
+    "status": {
+      "print_task_config": {
+        "filament_exist": [true, false, true, false],
+        "filament_type": ["PLA", "PETG", "PLA", "ABS"],
+        "filament_sub_type": ["CF", "NONE", "SnapSpeed", ""],
+        "filament_color_rgba": ["#11223344", "#FF0000", "#AABBCC", ""],
+        "filament_vendor": ["Acme", "Other", "Snapmaker", ""]
+      },
+      "filament_detect": {
+        "info": [
+          {"BED_TEMP": 60, "HOTEND_MAX_TEMP": 230},
+          {"BED_TEMP": 70, "HOTEND_MAX_TEMP": 250},
+          {},
+          {"BED_TEMP": 100, "HOTEND_MAX_TEMP": 260}
+        ]
+      }
+    }
+  }
+}
