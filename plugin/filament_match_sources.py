@@ -394,6 +394,64 @@ def _clean_vendor(value: Any) -> str:
     return text
 
 
+_MATERIAL_FAMILIES = (
+    "PETG",
+    "PCTG",
+    "PEEK",
+    "PMMA",
+    "BVOH",
+    "HIPS",
+    "PPA",
+    "PLA",
+    "TPU",
+    "TPE",
+    "PHA",
+    "PVA",
+    "ABS",
+    "ASA",
+    "CPE",
+    "SBS",
+    "EVA",
+    "PVC",
+    "PEI",
+    "POM",
+    "PC",
+    "PP",
+    "PE",
+    "PA",
+)
+
+
+def _split_material_variant(value: Any) -> tuple[str, str]:
+    """Split a combined printer material into ``(family, variant)``.
+
+    Printer payloads often encode the subtype in the material string itself
+    (``PLA-CF``, ``TPU-95A``, ``PLA Silk``).  Matching presets keep the family
+    in ``filament_type`` and the variant in the preset name/subtype, so expose
+    ``PLA`` + ``CF`` and retain the full combined value in the parser's raw
+    ``tray_type`` for diagnostics.
+    """
+
+    text = safe_str(value)
+    if not text or text.casefold() in _EMPTY_WORDS:
+        return "", ""
+    upper = text.upper()
+    for family in _MATERIAL_FAMILIES:
+        if not upper.startswith(family):
+            continue
+        remainder = text[len(family) :]
+        if remainder and remainder[0].isalpha():
+            continue
+        variant = remainder.strip(" \t_-/")
+        variant = " ".join(variant.replace("_", " ").replace("/", " ").split())
+        return family, variant
+
+    parts = re.split(r"[\s_/\-+]+", text, maxsplit=1)
+    material = parts[0].strip().upper()
+    variant = parts[1].strip() if len(parts) > 1 else ""
+    return material, " ".join(variant.split())
+
+
 def _truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -716,10 +774,13 @@ def _parse_snapmaker(payload: Any) -> list[Observation]:
 
         present = _truthy(exist_raw)
         if present:
-            material = _snapmaker_combine_type(type_raw, sub_raw)
+            tray_type = _snapmaker_combine_type(type_raw, sub_raw)
+            material, inferred_subtype = _split_material_variant(tray_type)
             subtype = _clean_subtype(sub_raw)
             if subtype.casefold() in _EMPTY_WORDS:
                 subtype = ""
+            if not subtype:
+                subtype = inferred_subtype
             vendor = _clean_vendor(vendor_raw)
             color = _normalize_source_color(color_raw)
             if not safe_str(color_raw):
@@ -730,6 +791,7 @@ def _parse_snapmaker(payload: Any) -> list[Observation]:
             filament_id = safe_str(filament_raw)
             spool_id = _positive_int(spool_raw)
         else:
+            tray_type = ""
             material = ""
             subtype = ""
             vendor = ""
@@ -768,6 +830,7 @@ def _parse_snapmaker(payload: Any) -> list[Observation]:
                     "filament_vendor": vendor_raw,
                     "filament_spool_id": spool_raw,
                     "filament_id": filament_raw,
+                    "tray_type": tray_type,
                     "filament_detect": dict(info_raw),
                 },
             )
@@ -868,7 +931,7 @@ def _parse_moonraker_lane_data(payload: Any) -> list[Observation]:
         if not isinstance(raw_material, str):
             # safe_json_string returns empty for non-string values.
             continue
-        material = _clean_material(raw_material)
+        material, inferred_subtype = _split_material_variant(raw_material)
         if not material:
             # Native sets has_filament from the material and skips empty lanes.
             continue
@@ -879,6 +942,8 @@ def _parse_moonraker_lane_data(payload: Any) -> list[Observation]:
         subtype = _clean_subtype(
             lane.get("subtype") or lane.get("sub_type") or lane.get("variant")
         )
+        if not subtype:
+            subtype = inferred_subtype
         product = safe_str(lane.get("product"))
         raw_color = lane.get("color")
         color = _normalize_source_color(raw_color) if isinstance(raw_color, str) else ""
@@ -894,6 +959,7 @@ def _parse_moonraker_lane_data(payload: Any) -> list[Observation]:
         seen_slots.add(slot)
         raw = dict(lane)
         raw["_key"] = key
+        raw["tray_type"] = raw_material
         observations.append(
             Observation(
                 slot=slot,
@@ -970,7 +1036,7 @@ def _parse_happy_hare(payload: Any) -> list[Observation]:
         raw_material = gate_value("gate_material")
         if not isinstance(raw_material, str):
             continue
-        material = _clean_material(raw_material)
+        material, subtype = _split_material_variant(raw_material)
         if not material:
             continue
         raw_color = gate_value("gate_color")
@@ -986,11 +1052,16 @@ def _parse_happy_hare(payload: Any) -> list[Observation]:
                 slot=gate_index + 1,
                 present=True,
                 material=material,
+                subtype=subtype,
                 color=color,
                 bed_temp=0,
                 nozzle_temp=nozzle_temp,
                 source=MOONRAKER_SOURCE,
-                raw={"gate_index": gate_index, "mmu": dict(mmu)},
+                raw={
+                    "gate_index": gate_index,
+                    "tray_type": raw_material,
+                    "mmu": dict(mmu),
+                },
             )
         )
     return observations
@@ -1049,11 +1120,12 @@ def _parse_creality_cfs(payload: Any) -> list[Observation]:
                 else ""
             )
             material_id = raw_material_id if isinstance(raw_material_id, str) else ""
-            material = _CREALITY_MATERIAL_TYPES.get(material_id, "")
-            if not material:
-                material = same_material.get(material_id, "")
-            if not material:
+            tray_type = _CREALITY_MATERIAL_TYPES.get(material_id, "")
+            if not tray_type:
+                tray_type = same_material.get(material_id, "")
+            if not tray_type:
                 continue
+            material, subtype = _split_material_variant(tray_type)
 
             raw_color = colors[slot_index] if slot_index < len(colors) else ""
             color_text = raw_color if isinstance(raw_color, str) else ""
@@ -1065,13 +1137,15 @@ def _parse_creality_cfs(payload: Any) -> list[Observation]:
                 Observation(
                     slot=(tray_index - 1) * 4 + slot_index + 1,
                     present=True,
-                    material=safe_str(material),
+                    material=material,
+                    subtype=subtype,
                     color=color,
                     source=MOONRAKER_SOURCE,
                     raw={
                         "tray": f"T{tray_index}",
                         "slot_index": (tray_index - 1) * 4 + slot_index,
                         "material_id": material_id,
+                        "tray_type": safe_str(tray_type),
                     },
                 )
             )

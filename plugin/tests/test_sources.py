@@ -1295,12 +1295,13 @@ class NativeSnapmakerTests(unittest.TestCase):
         first, second, third, fourth = observations
 
         self.assertTrue(first.present)
-        self.assertEqual(first.material, "PLA-CF")
+        self.assertEqual(first.material, "PLA")
         self.assertEqual(first.subtype, "CF")
         self.assertEqual(first.vendor, "Acme")
         self.assertEqual(first.color, "#112233")
         self.assertEqual(first.bed_temp, 60)
         self.assertEqual(first.nozzle_temp, 230)
+        self.assertEqual(first.raw["tray_type"], "PLA-CF")
 
         self.assertFalse(second.present)
         self.assertEqual(second.material, "")
@@ -1479,14 +1480,22 @@ class NativeMoonrakerTests(unittest.TestCase):
         by_slot = {observation.slot: observation for observation in observations}
         self.assertEqual(by_slot[1].material, "PLA")
         self.assertEqual(by_slot[1].color, "#FF0000")
-        self.assertEqual(by_slot[2].material, "PLA Silk")
+        self.assertEqual(by_slot[1].subtype, "")
+        self.assertEqual(by_slot[2].material, "PLA")
+        self.assertEqual(by_slot[2].subtype, "Silk")
         self.assertEqual(by_slot[2].color, "#00FF00")
         self.assertEqual(by_slot[4].material, "PETG")
         self.assertEqual(by_slot[4].color, "#ABCDEF")
         self.assertEqual(by_slot[9].material, "TPU")
-        self.assertEqual(by_slot[10].material, "PLA-CF")
-        self.assertEqual(by_slot[11].material, "PETG-CF")
-        self.assertEqual(by_slot[12].material, "PA-CF")
+        self.assertEqual(by_slot[9].subtype, "")
+        self.assertEqual(by_slot[10].material, "PLA")
+        self.assertEqual(by_slot[10].subtype, "CF")
+        self.assertEqual(by_slot[11].material, "PETG")
+        self.assertEqual(by_slot[11].subtype, "CF")
+        self.assertEqual(by_slot[12].material, "PA")
+        self.assertEqual(by_slot[12].subtype, "CF")
+        self.assertEqual(by_slot[10].raw["tray_type"], "PLA-CF")
+        self.assertEqual(by_slot[2].raw["tray_type"], "PLA Silk")
         self.assertTrue(all(observation.present for observation in observations))
 
         self.assertEqual(
@@ -1569,6 +1578,116 @@ class NativeMoonrakerTests(unittest.TestCase):
         self.assertEqual(len(observations), 4)
         self.assertEqual(len(calls), 1)
         self.assertTrue(calls[0].startswith("http://printer.local:7126/"))
+
+
+class MaterialVariantTests(unittest.TestCase):
+    def test_snapmaker_combined_material_exposes_family_and_subtype(self):
+        payload = {
+            "result": {
+                "status": {
+                    "print_task_config": {
+                        "filament_exist": [True, True, True, True],
+                        "filament_type": ["PLA-CF", "PLA", "PLA", "TPU-95A"],
+                        "filament_sub_type": ["", "", "CF", ""],
+                        "filament_color_rgba": [
+                            "#112233", "#445566", "#778899", "#AABBCC",
+                        ],
+                    }
+                }
+            }
+        }
+        observations = sources._parse_snapmaker(payload)
+        self.assertEqual(
+            [observation.material for observation in observations],
+            ["PLA", "PLA", "PLA", "TPU"],
+        )
+        self.assertEqual(
+            [observation.subtype for observation in observations],
+            ["CF", "", "CF", "95A"],
+        )
+        self.assertEqual(
+            [observation.raw["tray_type"] for observation in observations],
+            ["PLA-CF", "PLA", "PLA-CF", "TPU-95A"],
+        )
+
+    def test_moonraker_combined_material_exposes_family_and_subtype(self):
+        payload = {
+            "result": {
+                "value": {
+                    "lane1": {"lane": "0", "material": "PLA-CF"},
+                    "lane2": {"lane": "1", "material": "PLA"},
+                }
+            }
+        }
+        observations = sources._parse_moonraker(payload)
+        self.assertEqual(
+            [observation.material for observation in observations],
+            ["PLA", "PLA"],
+        )
+        self.assertEqual(
+            [observation.subtype for observation in observations],
+            ["CF", ""],
+        )
+        self.assertEqual(
+            [observation.raw["tray_type"] for observation in observations],
+            ["PLA-CF", "PLA"],
+        )
+
+    def test_happy_hare_combined_material_exposes_family_and_subtype(self):
+        payload = {
+            "result": {
+                "status": {
+                    "mmu": {
+                        "num_gates": 2,
+                        "gate_status": [1, 1],
+                        "gate_material": ["PLA-CF", "PLA"],
+                        "gate_color": ["#112233", "#445566"],
+                        "gate_temperature": [210, 210],
+                    }
+                }
+            }
+        }
+        observations = sources._parse_happy_hare(payload)
+        self.assertEqual(
+            [observation.material for observation in observations],
+            ["PLA", "PLA"],
+        )
+        self.assertEqual(
+            [observation.subtype for observation in observations],
+            ["CF", ""],
+        )
+        self.assertEqual(
+            [observation.raw["tray_type"] for observation in observations],
+            ["PLA-CF", "PLA"],
+        )
+
+    def test_creality_combined_material_exposes_family_and_subtype(self):
+        payload = {
+            "result": {
+                "status": {
+                    "box": {
+                        "T1": {
+                            "state": "connect",
+                            "material_type": ["000008", "000001", "000009", "000010"],
+                            "color_value": ["112233", "445566", "778899", "AABBCC"],
+                        }
+                    }
+                }
+            }
+        }
+        observations = sources._parse_creality_cfs(payload)
+        self.assertEqual(
+            [observation.material for observation in observations],
+            ["PLA", "PLA", "PETG", "PA"],
+        )
+        self.assertEqual(
+            [observation.subtype for observation in observations],
+            ["CF", "", "CF", "CF"],
+        )
+        self.assertEqual(
+            [observation.raw["tray_type"] for observation in observations],
+            ["PLA-CF", "PLA", "PETG-CF", "PA-CF"],
+        )
 
 
 class OfdCacheRegressionTests(unittest.TestCase):
