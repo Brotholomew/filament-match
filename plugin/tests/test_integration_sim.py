@@ -47,6 +47,9 @@ class FakePreset:
     def config_value(self, key):
         return self._values.get(key)
 
+    def config_keys(self):
+        return list(self._values)
+
     def label(self):
         return self._label or self.name
 
@@ -63,12 +66,14 @@ class FakeCollection:
 
 
 class FakeBundle:
-    def __init__(self, presets, slots, printer="Snapmaker U1", print_host="10.0.0.176"):
+    def __init__(self, presets, slots, printer="Snapmaker U1", print_host="10.0.0.176",
+                 data_dir=""):
         self.filaments = FakeCollection(presets)
         self.current_filament_preset_names = list(slots)
         self._printer_preset = FakePreset(printer, system=True)
         self._printer_preset._values["print_host"] = print_host
         self._values = {"print_host": print_host}
+        self.data_dir = data_dir
 
     @property
     def current_printer_preset(self):
@@ -244,6 +249,25 @@ class IntegrationSimulationTests(unittest.TestCase):
         with open(Path(self.storage) / "history.json", encoding="utf-8") as stream:
             return json.load(stream)
 
+    def _prepared_snapshot(self, presets, slots=None, printer="Snapmaker U1 (0.4 nozzle)"):
+        self.bundle = FakeBundle(presets, slots or [], printer=printer)
+        snapshot = self._snapshot()
+        snapshot.update({
+            "data_dir": self.storage,
+            "folder": "profile",
+            "folder_inferred": True,
+        })
+        (Path(self.storage) / "user" / "profile").mkdir(parents=True, exist_ok=True)
+        return snapshot
+
+    def _preset_info(self, snapshot, name):
+        return next(item for item in snapshot["presets"] if item.name == name)
+
+    def _local_filament_files(self):
+        directory = (Path(self.storage) / "user" / "profile" / "_local" /
+                     "filament_match" / "filament")
+        return sorted(directory.glob("*.json")) if directory.is_dir() else []
+
     # -- tests -----------------------------------------------------------
 
     def test_init_message_contains_presets_and_slots(self):
@@ -330,6 +354,27 @@ class IntegrationSimulationTests(unittest.TestCase):
         self.assertEqual(calls, ["storage"])
         self.assertTrue(any("init" in post for post in panel.posts))
         self.assertEqual(result.status, "success")
+
+    def test_execute_does_not_clear_a_newer_window(self):
+        panel = FakeWindow()
+        newer = FakeWindow()
+        capability = self.module.FilamentMatch()
+
+        def create_dock_panel(html, **kwargs):
+            on_close = kwargs["on_close"]
+
+            def feed():
+                time.sleep(0.05)
+                capability.window = newer
+                on_close()
+
+            threading.Thread(target=feed, daemon=True).start()
+            return panel
+
+        self.fake.host.ui.create_dock_panel = create_dock_panel
+        result = capability.execute()
+        self.assertEqual(result.status, "success")
+        self.assertIs(capability.window, newer)
 
     def test_page_layout_is_feeds_first_and_settings_collapsed(self):
         page = self.module.PAGE
@@ -831,13 +876,19 @@ class IntegrationSimulationTests(unittest.TestCase):
         copy_name = self.module._create_price_copy(
             custom_info, "10.07", snapshot, [])
         self.assertEqual(copy_name, "CC3D PETG (custom) (local)")
+        # Pressing Save price again must update the same copy, not create a
+        # second one just because a flattened user copy inherits the root.
+        self.assertEqual(
+            self.module._create_price_copy(custom_info, "11.07", snapshot, []),
+            copy_name)
+        self.assertEqual(len(self._local_filament_files()), 1)
         target = (Path(self.storage) / "user" / "profile" / "_local" /
                   "filament_match" / "filament" /
                   "CC3D PETG (custom) (local).json")
         self.assertTrue(target.exists())
         data = json.loads(target.read_text(encoding="utf-8"))
         self.assertEqual(data["inherits"], "Generic PETG @System")
-        self.assertEqual(data["filament_cost"], ["10.07"])
+        self.assertEqual(data["filament_cost"], ["11.07"])
         self.assertEqual(data["filament_vendor"], ["CC3D"])
         self.assertEqual(data["filament_type"], ["PETG"])
         self.assertEqual(data["nozzle_temperature"], ["240"])
@@ -1384,6 +1435,577 @@ class IntegrationSimulationTests(unittest.TestCase):
                 "snapshot": self._snapshot(),
             })
         self.assertIn("approve", str(caught.exception).casefold())
+
+    # -- audit regressions: preset filesystem (PF-01..PF-10) -------------
+
+    def test_library_install_uses_canonical_sanitized_name(self):
+        snapshot = self._prepared_snapshot([
+            FakePreset("Generic TPU @Test", vendor="Generic", material="TPU"),
+        ], ["Generic TPU @Test"], printer="Snapmaker U1 (0.4 nozzle)")
+
+        class Library:
+            def preset_is_cached(self, candidate):
+                return True
+
+            def fetch(self, candidate):
+                return {
+                    "name": "AzureFilm TPU/TPE (OFD)",
+                    "inherits": "Generic TPU @Test",
+                    "from": "User",
+                    "filament_type": ["TPU"],
+                    "filament_vendor": ["AzureFilm"],
+                }
+
+        original = self.module._ofd_library
+        self.module._ofd_library = lambda *args, **kwargs: Library()
+        try:
+            reply = self.module._apply_selection({
+                "slot": 1,
+                "preset_name": "AzureFilm TPU/TPE (OFD)",
+                "source": "library",
+                "candidate": {"preset_name": "AzureFilm TPU/TPE (OFD)"},
+                "remember": True,
+                "observation": {"vendor": "AzureFilm", "material": "TPU",
+                                "spool_id": 21},
+            }, snapshot, self._settings(ofd_enabled=True), self.storage, {}, [])
+        finally:
+            self.module._ofd_library = original
+
+        canonical = "AzureFilm TPU_TPE (OFD)"
+        self.assertEqual(self.selects, [(1, canonical)])
+        self.assertEqual(reply["applied"]["select_name"], canonical)
+        self.assertEqual(reply["applied"]["preset_name"],
+                         "_local/filament_match/" + canonical)
+        files = self._local_filament_files()
+        self.assertEqual([path.stem for path in files], [canonical])
+        installed = json.loads(files[0].read_text(encoding="utf-8"))
+        self.assertEqual(installed["name"], canonical)
+        self.assertEqual(installed["filament_settings_id"], [canonical])
+        saved = self._history()
+        self.assertEqual(saved["spools"]["21"]["default"],
+                         "_local/filament_match/" + canonical)
+
+    def test_library_install_sanitizes_quotes(self):
+        snapshot = self._prepared_snapshot([
+            FakePreset("Generic PETG @Test", vendor="Generic", material="PETG"),
+        ], [], printer="Snapmaker U1 (0.4 nozzle)")
+        preset = self.module._validated_library_preset({
+            "name": 'CC3D "Matte" PETG (OFD)',
+            "inherits": "Generic PETG @Test",
+            "from": "User",
+            "filament_type": ["PETG"],
+            "filament_vendor": ["CC3D"],
+        }, snapshot, [])
+        written = self.module._write_local_preset(preset, snapshot)
+        canonical = "CC3D _Matte_ PETG (OFD)"
+        self.assertEqual(written, canonical)
+        files = self._local_filament_files()
+        self.assertEqual([path.stem for path in files], [canonical])
+        installed = json.loads(files[0].read_text(encoding="utf-8"))
+        self.assertEqual(installed["name"], canonical)
+        self.assertEqual(installed["filament_settings_id"], [canonical])
+
+    def test_old_local_history_name_resolves_canonical_preset(self):
+        canonical = "AzureFilm TPU_TPE (OFD)"
+        preset = FakePreset(
+            "_local/filament_match/" + canonical, vendor="AzureFilm",
+            material="TPU", system=False, bundle_id="filament_match",
+            label=canonical)
+        self.bundle = FakeBundle([preset], ["_local/filament_match/" + canonical])
+        snapshot = self._snapshot()
+        history_cls = self.module._DEPS["HistoryStore"]
+        observation = self.observation_type(
+            slot=1, present=True, vendor="AzureFilm", material="TPU", spool_id=42)
+        history = history_cls(str(Path(self.storage) / "history.json"))
+        history.remember(observation, "Snapmaker U1",
+                         "_local/filament_match/AzureFilm TPU/TPE (OFD)")
+        self.module._DEPS["read_printer"] = lambda *a, **k: ([observation], [])
+        reply = self.capability._run({
+            "command": "scan",
+            "storage": self.storage,
+            "settings": self._settings(),
+            "snapshot": snapshot,
+        })
+        row = reply["scan"][0]
+        self.assertEqual(row["preset_name"], "_local/filament_match/" + canonical)
+        self.assertEqual(row["source"], "history")
+
+    # -- audit regressions: folder discovery (PF-02) ----------------------
+
+    def test_discover_user_folder_prefers_active_bundle_folder(self):
+        data = Path(self.storage) / "data"
+        (data / "user" / "default" / "machine").mkdir(parents=True)
+        active = data / "user" / "1a2b3c4d-1111-2222-3333-444455556666"
+        (active / "machine").mkdir(parents=True)
+        (active / "filament").mkdir(parents=True)
+        (active / "_local" / "filament_match").mkdir(parents=True)
+        folder, _why = self.module._discover_user_folder(str(data))
+        self.assertEqual(folder, active.name)
+        self.assertEqual(
+            self.module._discover_user_folder(
+                str(data), preferred="default")[0], "default")
+
+    def test_discover_user_folder_allows_existing_default(self):
+        data = Path(self.storage) / "data"
+        (data / "user" / "default" / "filament").mkdir(parents=True)
+        self.assertEqual(
+            self.module._discover_user_folder(str(data))[0], "default")
+
+    def test_snapshot_discovers_user_folder_for_system_only_profile(self):
+        data = Path(self.storage) / "data"
+        active = data / "user" / "1a2b3c4d-1111-2222-3333-444455556666"
+        (active / "machine").mkdir(parents=True)
+        self.bundle = FakeBundle([
+            FakePreset("Generic PLA @Test", vendor="Generic", material="PLA"),
+        ], [], printer="Snapmaker U1 (0.4 nozzle)", data_dir=str(data))
+        snapshot = self._snapshot()
+        self.assertEqual(snapshot["folder"], active.name)
+        self.assertTrue(snapshot["folder_inferred"])
+
+        written = self.module._write_local_preset({
+            "name": "CC3D PLA (OFD)",
+            "from": "User",
+            "type": "filament",
+            "instantiation": "true",
+            "inherits": "Generic PLA @Test",
+            "filament_type": ["PLA"],
+            "filament_vendor": ["CC3D"],
+        }, snapshot)
+        self.assertEqual(written, "CC3D PLA (OFD)")
+        target = (active / "_local" / "filament_match" / "filament" /
+                  "CC3D PLA (OFD).json")
+        self.assertTrue(target.exists())
+
+    # -- audit regressions: flattening and price copies (PF-03/PF-04) ----
+
+    def test_unreadable_user_preset_flattening_fails_loudly(self):
+        preset_cls = self.module._DEPS["PresetInfo"]
+        missing = Path(self.storage) / "missing.json"
+        item = preset_cls(
+            name="CC3D PETG (custom)", base="CC3D PETG", vendor="CC3D",
+            material="PETG", subtype="", color="", filament_id="",
+            compatible=True, system=False, user=True, bundle_id="",
+            file=str(missing), rank=0, config={})
+        snapshot = self._prepared_snapshot([
+            FakePreset("Generic PETG @Test", vendor="Generic", material="PETG"),
+        ], [])
+        with self.assertRaises(RuntimeError) as caught:
+            self.module._flatten_user_preset(item, snapshot)
+        self.assertIn("Could not read", str(caught.exception))
+        self.assertIn("CC3D PETG (custom)", str(caught.exception))
+
+    def test_cloud_user_preset_uses_live_config_values(self):
+        preset_cls = self.module._DEPS["PresetInfo"]
+        item = preset_cls(
+            name="Cloud PETG", base="Cloud PETG", vendor="Cloud",
+            material="PETG", subtype="", color="", filament_id="",
+            compatible=True, system=False, user=True, bundle_id="",
+            file="", rank=0,
+            config={"values": {
+                "inherits": "Generic PETG @Test",
+                "filament_type": ["PETG"],
+                "nozzle_temperature": ["245"],
+            }})
+        snapshot = self._prepared_snapshot([
+            FakePreset("Generic PETG @Test", vendor="Generic", material="PETG"),
+        ], [])
+        flat, root = self.module._flatten_user_preset(item, snapshot)
+        self.assertEqual(root, "Generic PETG @Test")
+        self.assertEqual(flat["nozzle_temperature"], ["245"])
+
+    def test_price_copies_for_same_base_do_not_overwrite(self):
+        first = FakePreset("eSUN PETG @U1 0.4 nozzle", vendor="eSUN",
+                           material="PETG", color="#111111")
+        second = FakePreset("eSUN PETG @A1 0.4 nozzle", vendor="eSUN",
+                            material="PETG", color="#222222")
+        snapshot = self._prepared_snapshot([
+            FakePreset("Generic PETG @Test", vendor="Generic", material="PETG"),
+            first, second,
+        ], ["eSUN PETG @U1 0.4 nozzle", "eSUN PETG @A1 0.4 nozzle"])
+        name_a = self.module._create_price_copy(
+            self._preset_info(snapshot, first.name), "10.00", snapshot, [])
+        name_b = self.module._create_price_copy(
+            self._preset_info(snapshot, second.name), "11.00", snapshot, [])
+        self.assertNotEqual(name_a, name_b)
+        files = {path.stem: json.loads(path.read_text(encoding="utf-8"))
+                 for path in self._local_filament_files()}
+        self.assertEqual(set(files), {name_a, name_b})
+        self.assertEqual(files[name_a]["inherits"], first.name)
+        self.assertEqual(files[name_b]["inherits"], second.name)
+
+    def test_price_copies_in_one_apply_batch_get_distinct_names(self):
+        first = FakePreset("eSUN PETG @U1 0.4 nozzle", vendor="eSUN",
+                           material="PETG")
+        second = FakePreset("eSUN PETG @A1 0.4 nozzle", vendor="eSUN",
+                            material="PETG")
+        snapshot = self._prepared_snapshot([
+            FakePreset("Generic PETG @Test", vendor="Generic", material="PETG"),
+            first, second,
+        ], ["eSUN PETG @U1 0.4 nozzle", "eSUN PETG @A1 0.4 nozzle"])
+        reply = self.capability._run({
+            "command": "apply_all",
+            "entries": [
+                {"slot": 1, "preset_name": first.name, "source": "installed",
+                 "remember": False, "price": "10.00",
+                 "observation": {"vendor": "eSUN", "material": "PETG"}},
+                {"slot": 2, "preset_name": second.name, "source": "installed",
+                 "remember": False, "price": "11.00",
+                 "observation": {"vendor": "eSUN", "material": "PETG"}},
+            ],
+            "storage": self.storage,
+            "settings": self._settings(),
+            "snapshot": snapshot,
+        })
+        self.assertEqual(reply["apply_errors"], [])
+        self.assertEqual(len(reply["applied_all"]), 2)
+        names = {item["select_name"] for item in reply["applied_all"]}
+        self.assertEqual(len(names), 2)
+        self.assertEqual(len(self._local_filament_files()), 2)
+
+    # -- audit regressions: local parent rules (PF-05) --------------------
+
+    def test_library_parent_rejects_user_parent(self):
+        user_parent = FakePreset("Generic PETG @User", vendor="Generic",
+                                 material="PETG", system=False, user=True,
+                                 compatible=True)
+        system_parent = FakePreset("Generic PETG @System", vendor="Generic",
+                                   material="PETG", compatible=True)
+        snapshot = self._prepared_snapshot(
+            [user_parent, system_parent], [], printer="Snapmaker U1 (0.4 nozzle)")
+        parent = self.module._compatible_library_parent(
+            "Generic PETG @User", snapshot)
+        self.assertIsNotNone(parent)
+        self.assertEqual(parent.name, "Generic PETG @System")
+
+    def test_library_parent_compares_nozzles_numerically(self):
+        snapshot = self._prepared_snapshot([
+            FakePreset("Generic PLA @System", vendor="Generic", material="PLA",
+                       compatible=False),
+            FakePreset("Generic PLA @U1 0.40 nozzle", vendor="Generic",
+                       material="PLA", compatible=True),
+        ], [], printer="Snapmaker U1 (0.4 nozzle)")
+        parent = self.module._compatible_library_parent(
+            "Generic PLA @System", snapshot)
+        self.assertIsNotNone(parent)
+        self.assertEqual(parent.name, "Generic PLA @U1 0.40 nozzle")
+
+    # -- audit regressions: write/reload rollback (PF-06) -----------------
+
+    def test_write_local_preset_rolls_back_on_reload_failure(self):
+        snapshot = self._prepared_snapshot([
+            FakePreset("Generic PLA @Test", vendor="Generic", material="PLA"),
+        ], [])
+        calls = []
+
+        def reload_local(bundle_id):
+            calls.append(bundle_id)
+            if len(calls) == 1:
+                raise RuntimeError("reload failed")
+
+        self.fake.host.preset.bundles.reload_local = reload_local
+        with self.assertRaises(RuntimeError) as caught:
+            self.module._write_local_preset({
+                "name": "CC3D PLA (OFD)",
+                "from": "User",
+                "type": "filament",
+                "instantiation": "true",
+                "inherits": "Generic PLA @Test",
+                "filament_type": ["PLA"],
+            }, snapshot)
+        self.assertIn("restored", str(caught.exception).casefold())
+        self.assertEqual(self._local_filament_files(), [])
+        self.assertEqual(len(calls), 2)
+
+    def test_price_update_restores_file_on_reload_failure(self):
+        snapshot = self._prepared_snapshot([
+            FakePreset("Generic PLA @Test", vendor="Generic", material="PLA"),
+        ], [])
+        path = (Path(self.storage) / "user" / "profile" / "_local" /
+                "filament_match" / "filament" / "CC3D PLA (OFD).json")
+        path.parent.mkdir(parents=True)
+        original = {
+            "name": "CC3D PLA (OFD)",
+            "inherits": "Generic PLA @Test",
+            "filament_cost": ["9.00"],
+        }
+        path.write_text(json.dumps(original), encoding="utf-8")
+        info = FakePreset("_local/filament_match/CC3D PLA (OFD)",
+                          vendor="CC3D", material="PLA", system=False,
+                          bundle_id="filament_match", file=str(path),
+                          label="CC3D PLA (OFD)")
+        calls = []
+
+        def reload_local(bundle_id):
+            calls.append(bundle_id)
+            if len(calls) == 1:
+                raise RuntimeError("reload failed")
+
+        self.fake.host.preset.bundles.reload_local = reload_local
+        with self.assertRaises(RuntimeError) as caught:
+            self.module._update_local_preset_price(info, "11.00", [])
+        self.assertIn("restored", str(caught.exception).casefold())
+        restored = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(restored["filament_cost"], ["9.00"])
+        self.assertEqual(len(calls), 2)
+
+    def test_unknown_config_key_is_refused_before_write(self):
+        snapshot = self._prepared_snapshot([
+            FakePreset("Generic PLA @Test", vendor="Generic", material="PLA"),
+        ], [])
+        snapshot["config_keys"] = ["filament_type", "filament_vendor"]
+        snapshot["config_keys_complete"] = True
+        with self.assertRaises(ValueError) as caught:
+            self.module._validated_library_preset({
+                "name": "CC3D PLA (OFD)",
+                "from": "User",
+                "inherits": "Generic PLA @Test",
+                "filament_type": ["PLA"],
+                "filament_vendor": ["CC3D"],
+                "unknown_widget_option": ["1"],
+            }, snapshot, [])
+        self.assertIn("unknown_widget_option", str(caught.exception))
+
+    def test_settings_save_preserves_unknown_keys_and_version(self):
+        settings_path = Path(self.storage) / "settings.json"
+        settings_path.write_text(json.dumps({
+            "version": 7,
+            "ofd_enabled": False,
+            "spoolman_url": "http://spoolman.test",
+            "future_option": {"keep": True},
+        }), encoding="utf-8")
+        loaded = self.module._load_settings(self.storage)
+        self.assertFalse(loaded["ofd_enabled"])
+        self.assertEqual(loaded["version"], 7)
+        self.assertEqual(loaded["future_option"], {"keep": True})
+        self.module._save_settings(self.storage, loaded)
+        saved = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["version"], 7)
+        self.assertEqual(saved["future_option"], {"keep": True})
+        self.assertFalse(saved["ofd_enabled"])
+
+        settings_path.write_text("{not json", encoding="utf-8")
+        self.assertTrue(self.module._load_settings(self.storage)["ofd_enabled"])
+        with self.assertRaises(RuntimeError):
+            self.module._save_settings(
+                self.storage, self.module._load_settings(self.storage))
+        self.assertEqual(settings_path.read_text(encoding="utf-8"), "{not json")
+
+    # -- audit regressions: filenames and JSON reads (PF-07/PF-08) --------
+
+    def test_safe_filename_is_utf8_byte_safe(self):
+        long_name = "é" * 100
+        safe = self.module._safe_filename(long_name)
+        self.assertLessEqual(len(safe.encode("utf-8")), 120)
+        self.assertEqual(safe.encode("utf-8").decode("utf-8"), safe)
+        first = self.module._safe_filename("A" * 130 + "B")
+        second = self.module._safe_filename("A" * 130 + "C")
+        self.assertNotEqual(first, second)
+        self.assertLessEqual(len(first.encode("utf-8")), 120)
+
+    def test_safe_filename_reserved_names_and_trailing_dots(self):
+        self.assertEqual(self.module._safe_filename("Name. . "), "Name")
+        for raw in ("CON", "PRN.json", "LPT1"):
+            safe = self.module._safe_filename(raw)
+            self.assertNotIn(
+                safe.split(".", 1)[0].upper(),
+                {"CON", "PRN", "LPT1"})
+
+    def test_preset_file_json_accepts_bom(self):
+        path = Path(self.storage) / "bom.json"
+        path.write_bytes(b"\xef\xbb\xbf" + json.dumps(
+            {"name": "BOM preset"}).encode("utf-8"))
+        self.assertEqual(
+            self.module._preset_file_json(str(path))["name"], "BOM preset")
+
+    def test_write_local_preset_refuses_to_overwrite_corrupt_json(self):
+        snapshot = self._prepared_snapshot([
+            FakePreset("Generic PLA @Test", vendor="Generic", material="PLA"),
+        ], [])
+        target = (Path(self.storage) / "user" / "profile" / "_local" /
+                  "filament_match" / "filament" / "Corrupt.json")
+        target.parent.mkdir(parents=True)
+        target.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(RuntimeError) as caught:
+            self.module._write_local_preset({
+                "name": "Corrupt",
+                "from": "User",
+                "type": "filament",
+                "instantiation": "true",
+                "inherits": "Generic PLA @Test",
+                "filament_type": ["PLA"],
+            }, snapshot)
+        self.assertIn("not valid JSON", str(caught.exception))
+        self.assertEqual(target.read_text(encoding="utf-8"), "{not json")
+
+    # -- audit regressions: permissions and host API (PF-10) --------------
+
+    def test_permission_hints_cover_windows_and_macos(self):
+        for text in ("[WinError 5] Access is denied",
+                     "OSError: [Errno 1] Operation not permitted"):
+            hint = self.module._permission_hint(text)
+            self.assertIn("approve", hint.casefold())
+
+    def test_snapshot_handles_preset_without_config_value(self):
+        class BarePreset:
+            name = "Bare PLA @Test"
+            alias = ""
+            file = ""
+            bundle_id = ""
+            is_default = False
+            is_system = True
+            is_user = False
+            is_visible = True
+            is_compatible = True
+
+            def config_keys(self):
+                return []
+
+        self.bundle = FakeBundle([BarePreset()], ["Bare PLA @Test"])
+        snapshot = self._snapshot()
+        info = self._preset_info(snapshot, "Bare PLA @Test")
+        self.assertEqual(info.config["inherits"], "")
+
+    # -- audit regressions: UI backend (UI-08..UI-12) --------------------
+
+    def test_scan_reports_feed_count_from_all_observations(self):
+        observations = self._observations() + [
+            self.observation_type(slot=3, present=False, source="snapmaker"),
+            self.observation_type(slot=4, present=False, source="snapmaker"),
+        ]
+        self.module._DEPS["read_printer"] = lambda *a, **k: (observations, [])
+        reply = self.capability._run({
+            "command": "scan",
+            "storage": self.storage,
+            "settings": self._settings(),
+            "snapshot": self._snapshot(),
+        })
+        self.assertEqual(reply["feeders"], 4)
+        self.assertTrue(reply["feeders_known"])
+        self.assertEqual(reply["slot_mismatch"]["missing_slots"], 2)
+
+    def test_unknown_feed_total_suppresses_mismatch(self):
+        observations = [
+            self.observation_type(slot=1, present=True, vendor="Prusament",
+                                  material="PLA", source="moonraker"),
+            self.observation_type(slot=2, present=True, vendor="Prusament",
+                                  material="PETG", source="moonraker"),
+        ]
+        self.module._DEPS["read_printer"] = lambda *a, **k: (observations, [])
+        self.bundle = FakeBundle([], ["Prusament PLA @Test"])
+        reply = self.capability._run({
+            "command": "scan",
+            "storage": self.storage,
+            "settings": self._settings(),
+            "snapshot": self._snapshot(),
+        })
+        self.assertFalse(reply["feeders_known"])
+        self.assertEqual(reply["slot_mismatch"]["message"], "")
+
+    def test_connected_flag_is_only_a_hint(self):
+        self.assertEqual(self.module._printer_problem({
+            "host": "10.0.0.176",
+            "selected": {"connected": False, "online": False},
+        }), "")
+
+    def test_enrich_spoolman_resets_cache_per_scan(self):
+        class Client:
+            base_url = "https://spoolman.test"
+            calls = 0
+
+            def get_spool(self, spool_id):
+                self.calls += 1
+                return {"price": 12.00, "initial_weight": 1000,
+                        "filament": {"name": "PETG", "weight": 1000}}
+
+        client = Client()
+        session = {
+            "spoolman_client": client,
+            "spoolman_url": "https://spoolman.test",
+            "spoolman_cache": {"9": ({"price": 1.00}, {})},
+        }
+        observation = self.observation_type(
+            slot=1, present=True, vendor="eSUN", material="PETG", spool_id=9)
+        self.module._enrich_spoolman(
+            [observation], {"spoolman_url": "https://spoolman.test"}, session, [])
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(session["spool_prices"]["9"], "12.00")
+
+    def test_ofd_preflight_runs_once_per_scan(self):
+        class Library:
+            cache_path = str(Path(self.storage) / "missing-ofd-index.json")
+
+            def __init__(self):
+                self.calls = 0
+
+            def find(self, *args, **kwargs):
+                self.calls += 1
+                return []
+
+        library = Library()
+        calls = []
+        original = self.module._ofd_library
+        self.module._ofd_library = lambda *a, **k: library
+        self.module._preflight_host = lambda url: calls.append(url)
+        session = {}
+        try:
+            observation = self._observations()[0]
+            self.module._library_candidates(
+                observation, self._settings(ofd_enabled=True), self.storage,
+                session, [])
+            self.module._library_candidates(
+                observation, self._settings(ofd_enabled=True), self.storage,
+                session, [])
+        finally:
+            self.module._ofd_library = original
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(library.calls, 1)
+
+    def test_ofd_preflight_failure_cached_per_scan(self):
+        class Library:
+            cache_path = str(Path(self.storage) / "missing-ofd-index.json")
+
+            def __init__(self):
+                self.calls = 0
+
+            def find(self, *args, **kwargs):
+                self.calls += 1
+                return []
+
+        library = Library()
+        calls = []
+        original = self.module._ofd_library
+        self.module._ofd_library = lambda *a, **k: library
+
+        def deny(url):
+            calls.append(url)
+            raise RuntimeError("permission denied by audit")
+
+        self.module._preflight_host = deny
+        session = {}
+        warnings = []
+        try:
+            observation = self._observations()[0]
+            first = self.module._library_candidates(
+                observation, self._settings(ofd_enabled=True), self.storage,
+                session, warnings)
+            second = self.module._library_candidates(
+                observation, self._settings(ofd_enabled=True), self.storage,
+                session, warnings)
+        finally:
+            self.module._ofd_library = original
+        self.assertEqual(first, [])
+        self.assertEqual(second, [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(library.calls, 0)
+        self.assertEqual(len(warnings), 1)
+
+    def test_log_error_survives_missing_stderr(self):
+        original = sys.stderr
+        try:
+            sys.stderr = None
+            self.module._log_error("no stream")
+        finally:
+            sys.stderr = original
 
     def test_apply_rejects_slot_beyond_project(self):
         with self.assertRaises(ValueError):

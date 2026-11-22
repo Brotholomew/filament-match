@@ -143,6 +143,17 @@ def _error_text(error):
     return text or type(error).__name__
 
 
+def _log_error(text):
+    """Best-effort diagnostic log for GUI builds that have no stderr."""
+    stream = getattr(sys, "stderr", None)
+    if stream is None:
+        return
+    try:
+        print(text, file=stream)
+    except Exception:
+        pass
+
+
 def _permission_hint(value):
     """Explain Orca's audit denial, which is retryable after the user approves.
 
@@ -152,7 +163,10 @@ def _permission_hint(value):
     """
     text = _error_text(value).casefold()
     blocked = ("permission denied" in text or "permissionerror" in text
-               or "errno 13" in text or "without permission" in text
+               or "errno 13" in text or "errno 1" in text
+               or "operation not permitted" in text
+               or "access is denied" in text or "winerror 5" in text
+               or "without permission" in text
                or "permission required" in text
                or ("audit" in text and "denied" in text))
     if not blocked:
@@ -332,6 +346,20 @@ def _base_name(name, bundle_id=""):
     return name.split(" @", 1)[0].strip()
 
 
+def _canonical_preset_key(value):
+    """A comparison key that tolerates old unsanitized local-bundle names."""
+    text = _text(value)
+    match = re.match(r"^_(?:local|subscribed)/[^/]+/", text, re.I)
+    if match:
+        text = text[match.end():]
+    text = _base_name(text)
+    try:
+        text = _safe_filename(text)
+    except ValueError:
+        return ""
+    return _normalized_label(text)
+
+
 def _selector_name(preset):
     """The name the slot selector accepts: label/alias, not internal name.
 
@@ -388,12 +416,28 @@ def _provenance(system, user, bundle_id):
 # ---------------------------------------------------------------------------
 
 def _read_json(path, default):
+    """Read JSON, accepting a UTF-8 BOM. Missing/corrupt files use ``default``."""
     try:
-        with open(path, "r", encoding="utf-8") as stream:
+        with open(path, "r", encoding="utf-8-sig") as stream:
             value = json.load(stream)
         return value
-    except (OSError, ValueError):
+    except (OSError, ValueError, TypeError):
         return default
+
+
+def _read_json_checked(path):
+    """Read one JSON document or raise with a useful message.
+
+    Used before any overwrite so a corrupt preset/settings file is never
+    replaced by a partial or silently rebuilt document.
+    """
+    try:
+        with open(path, "r", encoding="utf-8-sig") as stream:
+            return json.load(stream)
+    except OSError as error:
+        raise OSError("%s: %s" % (path, _error_text(error)))
+    except ValueError as error:
+        raise ValueError("%s is not valid JSON: %s" % (path, _error_text(error)))
 
 
 def _write_json_atomic(path, value):
@@ -450,6 +494,98 @@ def _user_path(path):
     return "", ""
 
 
+def _folder_activity(path):
+    """(file count, newest mtime) for one user preset folder."""
+    count = 0
+    newest = 0.0
+    for section in _USER_SECTIONS:
+        directory = os.path.join(path, section)
+        if not os.path.isdir(directory):
+            continue
+        try:
+            for entry in os.scandir(directory):
+                if not entry.is_file():
+                    continue
+                count += 1
+                try:
+                    newest = max(newest, entry.stat().st_mtime)
+                except OSError:
+                    continue
+                if count >= 400:
+                    break
+        except OSError:
+            continue
+        if count >= 400:
+            break
+    return count, newest
+
+
+def _discover_user_folder(data_dir, preferred="", existing=""):
+    """Find Orca's active user preset folder below ``<data_dir>/user``.
+
+    ``preferred`` is a folder already inferred from a readable preset file;
+    ``existing`` is an older guess from a previous scan. Both win when the
+    folder still exists. Otherwise score the folders by preset layout, local /
+    subscribed bundles and recent files, so a system-only profile (every
+    filament preset from a system bundle) can still install into the right
+    UUID/cloud folder instead of hardcoding ``default``.
+    """
+    if isinstance(preferred, dict):
+        # Also accept a snapshot, as described in the fix plan.
+        snapshot = preferred
+        preferred = _text(snapshot.get("folder"))
+        existing = existing or _text(snapshot.get("preset_folder"))
+    data_dir = _text(data_dir)
+    if not data_dir:
+        return "", ""
+    user_root = os.path.join(data_dir, "user")
+    folders = {}
+    try:
+        for entry in os.scandir(user_root):
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    folders[entry.name] = entry.path
+            except OSError:
+                continue
+    except OSError:
+        return "", ""
+    for candidate in (_text(preferred), _text(existing)):
+        if candidate and candidate in folders:
+            return candidate, candidate
+    if not folders:
+        return "", ""
+
+    scored = []
+    uuid_re = re.compile(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        re.I)
+    for name, path in folders.items():
+        score = 0
+        for section in _USER_SECTIONS:
+            if os.path.isdir(os.path.join(path, section)):
+                score += 3
+        local = os.path.join(path, "_local")
+        subscribed = os.path.join(path, "_subscribed")
+        if os.path.isdir(os.path.join(local, BUNDLE_ID)):
+            score += 12
+        elif os.path.isdir(local):
+            score += 5
+        if os.path.isdir(subscribed):
+            score += 3
+        if uuid_re.match(name):
+            # Orca's cloud/profile installs use UUID folder names; treat them
+            # as slightly more likely than a stale empty "default".
+            score += 2
+        count, newest = _folder_activity(path)
+        score += min(count, 20) // 2
+        # On an exact score/recent tie, prefer the UUID/cloud profile over a
+        # stale "default"; the default still wins when it has real activity.
+        scored.append((-score, -newest, 0 if uuid_re.match(name) else 1, name))
+    scored.sort()
+    found = scored[0][3]
+    return found, found
+
+
 def _settings_path(storage):
     return os.path.join(storage, "settings.json")
 
@@ -464,12 +600,27 @@ def _default_settings():
         "ofd_enabled": True,
         "ofd_index_url": DEFAULT_OFD_INDEX,
         "ignored": [],
+        "version": 1,
     }
+
+
+def _settings_version(value):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 1
+    return number if number > 0 else 1
 
 
 def _normalize_settings(raw):
     defaults = _default_settings()
     raw = raw if isinstance(raw, dict) else {}
+    # Keep keys written by a newer plugin/release instead of rebuilding only
+    # the fields this version understands.
+    for key, value in raw.items():
+        key = _text(key)
+        if key and key not in defaults:
+            defaults[key] = _jsonable(value)
     for key in ("spoolman_url", "ofd_index_url"):
         value = _text(raw.get(key))
         if key == "ofd_index_url" and not value:
@@ -481,6 +632,7 @@ def _normalize_settings(raw):
     if isinstance(flag, str):
         flag = flag.strip().lower() in ("1", "true", "yes", "on")
     defaults["ofd_enabled"] = bool(flag)
+    defaults["version"] = _settings_version(raw.get("version", 1))
     ignored, seen = [], set()
     for item in raw.get("ignored") or []:
         item = _text(item)
@@ -497,8 +649,17 @@ def _load_settings(storage):
 
 
 def _save_settings(storage, settings):
+    path = _settings_path(storage)
+    if os.path.isfile(path):
+        try:
+            _read_json_checked(path)
+        except (OSError, ValueError) as error:
+            raise RuntimeError(
+                "Refusing to overwrite the corrupt settings file at %s: %s. "
+                "Fix or remove it, then save again." %
+                (path, _error_text(error)))
     settings = _normalize_settings(settings)
-    _write_json_atomic(_settings_path(storage), dict(settings, version=1))
+    _write_json_atomic(path, settings)
     return settings
 
 
@@ -544,7 +705,7 @@ def _preset_file_json(path):
     if cached is not None:
         return cached
     try:
-        with open(path, "r", encoding="utf-8") as stream:
+        with open(path, "r", encoding="utf-8-sig") as stream:
             data = json.load(stream)
         if not isinstance(data, dict):
             data = {}
@@ -556,12 +717,49 @@ def _preset_file_json(path):
     return data
 
 
+def _preset_config_value(preset, key):
+    """Read one config value from a host Preset without assuming the API."""
+    getter = getattr(preset, "config_value", None)
+    if not callable(getter):
+        return ""
+    try:
+        return _first(getter(key))
+    except Exception:
+        return ""
+
+
+def _preset_config_values(preset):
+    """All own values of a user preset, for flattening a price copy.
+
+    Orca keeps the current edited value in the preset even when the on-disk
+    JSON is stale or unavailable (cloud presets). Copying those values is what
+    makes the copy faithful; the file is only a fallback for keys the host
+    does not expose.
+    """
+    values = {}
+    try:
+        keys = preset.config_keys() or []
+    except Exception:
+        return values
+    for key in keys:
+        key = _text(key)
+        if not key:
+            continue
+        getter = getattr(preset, "config_value", None)
+        if not callable(getter):
+            return values
+        try:
+            value = getter(key)
+        except Exception:
+            continue
+        if value is not None:
+            values[key] = _jsonable(value)
+    return values
+
+
 def _preset_value(preset, file_data, keys):
     for key in keys:
-        try:
-            value = _first(preset.config_value(key))
-        except Exception:
-            value = ""
+        value = _preset_config_value(preset, key)
         if value:
             return value
     for key in keys:
@@ -699,9 +897,9 @@ def _printer_problem(info):
         return ("No printer is selected in OrcaSlicer. Connect a printer in the Device "
                 "tab (or select a printer preset with a print host), then press the "
                 "rescan (↻) button.")
-    if selected and not (selected.get("connected") or selected.get("online")):
-        return ("The printer selected in OrcaSlicer is not connected. Connect it in "
-                "the Device tab, then press the rescan (↻) button.")
+    # connected/online are only hints. A printer can be reachable before Orca
+    # reports it as connected, so still attempt the request and report the
+    # actual network error instead of blocking the scan.
     return ""
 
 
@@ -719,7 +917,8 @@ def _preset_snapshot(bundle):
     collection = bundle.filaments
     presets, ui_presets = [], []
     select_names = {}
-    folder, data_dir = "", ""
+    known_config_keys = set()
+    folder, data_dir = "", _text(_member(bundle, "data_dir", "") or "")
     slots = _member(bundle, "current_filament_preset_names", []) or []
     if not isinstance(slots, (list, tuple)):
         slots = []
@@ -754,6 +953,11 @@ def _preset_snapshot(bundle):
         compatible_flag = _flag(preset, "is_compatible", True)
         selector = _selector_name(preset) or name
         file_path = _text(_member(preset, "file", ""))
+        try:
+            known_config_keys.update(
+                _text(key) for key in (preset.config_keys() or []) if _text(key))
+        except Exception:
+            pass
 
         # Only user presets and local bundles have readable JSON. System
         # presets are usually served from .opc vendor caches in 2.5.2, so do
@@ -780,13 +984,21 @@ def _preset_snapshot(bundle):
         cost = _price_value(_preset_value(
             preset, file_data, ("filament_cost", "cost")))
         inherits = (_text(file_data.get("inherits")) or
-                    _text(preset.config_value("inherits")))
+                    _preset_config_value(preset, "inherits"))
         base = _base_name(selector, bundle_id)
         rank = 2 if system else 1 if bundle_id else 0
         provenance = _provenance(system, user, bundle_id)
         preset_nozzle = _preset_nozzle(name)
         is_compatible = bool(
             compatible_flag and visible and _nozzles_match(preset_nozzle, printer_nozzle))
+        config = {
+            "filament_cost": cost,
+            "inherits": inherits,
+        }
+        if user:
+            values = _preset_config_values(preset)
+            if values:
+                config["values"] = values
 
         info = _make_preset_info({
             "name": name,
@@ -802,10 +1014,7 @@ def _preset_snapshot(bundle):
             "bundle_id": bundle_id,
             "file": file_path,
             "rank": rank,
-            "config": {
-                "filament_cost": cost,
-                "inherits": inherits,
-            },
+            "config": config,
         })
         # PresetInfo is a plain dataclass; the label is an extra attribute so
         # candidates returned by the matcher keep it without another lookup.
@@ -861,11 +1070,41 @@ def _preset_snapshot(bundle):
         if not changed:
             break
 
-    folder_inferred = bool(folder)
     if not data_dir:
         data_dir = _data_dir_from_plugin()
+    discovered = ""
+    if data_dir:
+        discovered, _why = _discover_user_folder(
+            data_dir, preferred=folder,
+            existing=_text(_member(bundle, "preset_folder", "")))
+        if discovered:
+            folder = discovered
+    folder_inferred = bool(folder)
     if not folder:
         folder = "default"
+    config_keys_complete = False
+    full_keys = _member(bundle, "full_config_keys", None)
+    if callable(full_keys):
+        try:
+            found_keys = [_text(key) for key in (full_keys() or []) if _text(key)]
+            known_config_keys.update(found_keys)
+            config_keys_complete = bool(found_keys)
+        except Exception:
+            pass
+    elif isinstance(full_keys, (list, tuple, set)):
+        found_keys = [_text(key) for key in full_keys if _text(key)]
+        known_config_keys.update(found_keys)
+        config_keys_complete = bool(found_keys)
+    full_config = _member(bundle, "full_config", None)
+    if callable(full_config):
+        try:
+            full_config = full_config()
+        except Exception:
+            full_config = None
+    if isinstance(full_config, dict):
+        found_keys = [_text(key) for key in full_config if _text(key)]
+        known_config_keys.update(found_keys)
+        config_keys_complete = config_keys_complete or bool(found_keys)
     ui_presets.sort(key=lambda item: (item["rank"], item["base"].casefold(),
                                       item["select_name"].casefold(), item["name"].casefold()))
     compatible = [preset for preset in presets if preset.compatible]
@@ -881,6 +1120,8 @@ def _preset_snapshot(bundle):
         "folder": folder,
         "folder_inferred": folder_inferred,
         "data_dir": data_dir,
+        "config_keys": sorted(known_config_keys),
+        "config_keys_complete": config_keys_complete,
     }
 
 
@@ -898,6 +1139,19 @@ def _find_preset(presets, name):
     wanted = _base_name(name)
     same = [preset for preset in presets if _base_name(preset.name, preset.bundle_id).casefold()
             == wanted.casefold()]
+    if same:
+        return min(same, key=lambda preset: getattr(preset, "rank", 9))
+    # Existing local presets written before the canonical-name fix can have a
+    # history/name with the unsanitized display form while their file uses the
+    # sanitized stem. Compare both through the same canonicalizer.
+    wanted_key = _canonical_preset_key(name)
+    if not wanted_key:
+        return None
+    same = [preset for preset in presets
+            if wanted_key in (
+                _canonical_preset_key(preset.name),
+                _canonical_preset_key(getattr(preset, "select_name", "")),
+            )]
     return min(same, key=lambda preset: getattr(preset, "rank", 9)) if same else None
 
 
@@ -918,9 +1172,14 @@ def _find_live_preset(bundle, name):
         selector = _selector_name(preset)
         if internal.casefold() == folded or selector.casefold() == folded:
             return preset
+    wanted_key = _canonical_preset_key(name)
     for index in range(int(collection.size())):
         preset = collection.preset(index)
         if _base_name(_selector_name(preset)).casefold() == _base_name(name).casefold():
+            return preset
+        if wanted_key and wanted_key in (
+                _canonical_preset_key(_member(preset, "name", "")),
+                _canonical_preset_key(_selector_name(preset))):
             return preset
     return None
 
@@ -967,8 +1226,8 @@ def _live_preset_detail(bundle, name):
             preset, file_data, ("filament_colour", "filament_color", "color"))),
         "filament_id": _preset_value(
             preset, file_data, ("filament_id", "filament_ids")),
-        "inherits": _first(file_data.get("inherits")) or _first(
-            preset.config_value("inherits") if _has_config_key(preset, "inherits") else ""),
+        "inherits": _first(file_data.get("inherits")) or _preset_config_value(
+            preset, "inherits"),
         "from": _first(file_data.get("from")),
         "config": config,
     }
@@ -1204,7 +1463,10 @@ def _spoolman_filament(client, spool_id, session):
 
 
 def _enrich_spoolman(observations, settings, session, warnings):
+    # Prices are per scan. A cached spool record from an earlier scan may be a
+    # different filament after a swap, so always start clean.
     session["spool_prices"] = {}
+    session["spoolman_cache"] = {}
     url = _text(settings.get("spoolman_url"))
     status = {
         "available": False,
@@ -1415,6 +1677,30 @@ def _library_url(index_url, entry):
     return urllib.parse.urljoin(base, path)
 
 
+def _library_needs_preflight(library):
+    """Whether an OFD lookup will hit the network (not just cache)."""
+    if library is None:
+        return False
+    if getattr(library, "_index", None) is not None:
+        return False
+    cache_path = getattr(library, "cache_path", None)
+    if not cache_path:
+        # A custom/fake library owns its own transport; do not preflight an
+        # origin it may not use.
+        return False
+    checker = getattr(library, "_cache_is_fresh", None)
+    if callable(checker):
+        try:
+            if checker():
+                return False
+        except Exception:
+            pass
+    try:
+        return not os.path.isfile(os.fspath(cache_path))
+    except (OSError, TypeError):
+        return True
+
+
 def _library_candidates(observation, settings, storage, session, warnings):
     if not settings.get("ofd_enabled"):
         return []
@@ -1422,10 +1708,28 @@ def _library_candidates(observation, settings, storage, session, warnings):
             _text(getattr(observation, "material", "")) or
             _text(getattr(observation, "product", ""))):
         return []
+    if isinstance(session, dict) and session.get("ofd_scan_failure"):
+        return []
+    query = (
+        _text(getattr(observation, "vendor", "")),
+        _text(getattr(observation, "material", "")),
+        _text(getattr(observation, "product", "")),
+        _text(getattr(observation, "subtype", "")),
+    )
+    result_cache = session.setdefault("ofd_result_cache", {}) \
+        if isinstance(session, dict) else {}
+    if query in result_cache:
+        return list(result_cache[query])
+    index_url = _text(settings.get("ofd_index_url")) or DEFAULT_OFD_INDEX
     try:
         library = _ofd_library(settings, storage, session, warnings)
         if library is None:
             return []
+        # One origin preflight per scan, before the first network-backed
+        # library lookup, not one permission prompt per row. A fresh disk
+        # cache or an already-loaded index needs no network at all.
+        if _library_needs_preflight(library):
+            _preflight_host(index_url)
         entries = library.find(
             _text(getattr(observation, "vendor", "")),
             _text(getattr(observation, "material", "")),
@@ -1434,12 +1738,16 @@ def _library_candidates(observation, settings, storage, session, warnings):
         )
     except Exception as error:
         hint = _permission_hint(error)
-        _warn(warnings, ("Open Filament Database: %s" % hint) if hint
-              else ("Open Filament Database: %s" % _error_text(error)))
+        message = hint or ("Open Filament Database: %s" % _error_text(error))
+        if isinstance(session, dict):
+            session["ofd_scan_failure"] = message
+        _warn(warnings, message if hint else message)
         return []
     if isinstance(entries, dict):
         entries = entries.get("results") or entries.get("items") or entries.get("candidates") or []
     if entries is None:
+        if isinstance(session, dict):
+            result_cache[query] = []
         return []
     if isinstance(entries, (str, bytes)) or not isinstance(entries, (list, tuple)):
         entries = [entries]
@@ -1485,6 +1793,8 @@ def _library_candidates(observation, settings, storage, session, warnings):
         ))
         if len(result) >= 10:
             break
+    if isinstance(session, dict):
+        result_cache[query] = list(result)
     return result
 
 
@@ -1515,6 +1825,31 @@ class _EmptyHistory:
 
     def clear(self):
         return False
+
+
+class _HistoryAliasView:
+    """Translate old unsanitized local-bundle history names to loaded presets.
+
+    The matcher decides whether a remembered name still exists by exact name.
+    Before PF-01 the JSON/file stem and the recorded name could differ (for
+    example ``AzureFilm TPU/TPE (OFD)`` vs ``AzureFilm TPU_TPE (OFD)``), so a
+    valid mapping looked stale after restart. This read-only view preserves the
+    store's public methods and only rewrites ``get()``.
+    """
+
+    def __init__(self, history, presets):
+        self._history = history
+        self._presets = presets or []
+
+    def get(self, observation, printer=""):
+        name = self._history.get(observation, printer)
+        if not name:
+            return name
+        preset = _find_preset(self._presets, name)
+        return preset.name if preset is not None else name
+
+    def __getattr__(self, name):
+        return getattr(self._history, name)
 
 
 def _generic_name(observation, presets):
@@ -1605,6 +1940,8 @@ def _build_row(observation, snapshot, history, settings, storage, session, warni
                use_history=True):
     if not use_history:
         history = {}
+    elif not isinstance(history, _EmptyHistory) and not isinstance(history, dict):
+        history = _HistoryAliasView(history, snapshot.get("presets") or [])
     compatible = snapshot.get("compatible") or []
     printer = snapshot.get("printer") or ""
     library = []
@@ -1797,7 +2134,34 @@ def _slot_mismatch(feeders, slots):
     }
 
 
+def _feed_count(observations):
+    """(reported feed count, whether the total is authoritative).
+
+    Snapmaker reports one observation per physical slot (including empty
+    slots), so ``len`` is the printer total. A source that only reports loaded
+    lanes (Moonraker/AMS) has no total; do not invent a mismatch for it.
+    """
+    observations = list(observations or [])
+    if not observations:
+        return 0, False
+    sources = {
+        _text(getattr(item, "source", "")).casefold() for item in observations
+        if _text(getattr(item, "source", ""))
+    }
+    has_empty = any(getattr(item, "present", True) is False for item in observations)
+    known = bool(has_empty or "snapmaker" in sources)
+    return len(observations), known
+
+
 def _scan_rows(settings, snapshot, storage, session, warnings):
+    if isinstance(session, dict):
+        # A scan is a fresh view of the printer and Spoolman; do not reuse a
+        # previous scan's price or OFD result for the same spool/preset.
+        session["spoolman_cache"] = {}
+        session["spool_prices"] = {}
+        session["ofd_result_cache"] = {}
+        session.pop("ofd_scan_failure", None)
+        session.pop("ofd_scan_warned", None)
     observations = _read_printer(snapshot, warnings)
     _enrich_spoolman(observations, settings, session, warnings)
     if not observations:
@@ -1816,17 +2180,57 @@ def _scan_rows(settings, snapshot, storage, session, warnings):
 # Preset selection and library install (worker thread only)
 # ---------------------------------------------------------------------------
 
-def _safe_filename(name):
-    text = re.sub(r"[\x00-\x1f]", " ", _text(name))
+WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+}
+MAX_FILENAME_BYTES = 120
+
+
+def _truncate_utf8(text, limit):
+    """Truncate to at most ``limit`` UTF-8 bytes without splitting a codepoint."""
+    raw = text.encode("utf-8")
+    if len(raw) <= limit:
+        return text
+    return raw[:max(0, limit)].decode("utf-8", "ignore")
+
+
+def _hash_suffix(seed):
+    return " " + hashlib.sha1(seed.encode("utf-8")).hexdigest()[:8]
+
+
+def _safe_filename(name, salt=""):
+    """Windows-safe preset file stem, truncated by UTF-8 bytes.
+
+    The stem doubles as the canonical preset name (PF-01), so it must be
+    stable and must not change when a name is long. A truncated or salted stem
+    gets a short hash so two distinct long names cannot map to one file.
+    """
+    original = _text(name)
+    text = re.sub(r"[\x00-\x1f]", " ", original)
     for char in BAD_FILENAME_CHARS:
         text = text.replace(char, "_")
-    text = text.strip().strip(".")[:120].strip()
+    text = text.strip().lstrip(".").strip()
+    truncated = len(text.encode("utf-8")) > MAX_FILENAME_BYTES
+    if truncated:
+        text = _truncate_utf8(text, MAX_FILENAME_BYTES)
+    text = text.rstrip(" .")
     if not text:
         raise ValueError("The preset name cannot be used as a file name")
-    if text.upper() in {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4",
-                        "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2",
-                        "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"}:
-        text += "_preset"
+    stem = text.split(".", 1)[0]
+    if stem.upper() in WINDOWS_RESERVED_NAMES:
+        # The reserved name rule applies before the extension: CON.json is
+        # still reserved. Insert the marker into the stem, not the suffix.
+        text = stem + "_preset" + text[len(stem):]
+    seed = _text(salt) or (original if truncated else "")
+    if seed:
+        suffix = _hash_suffix(seed)
+        room = MAX_FILENAME_BYTES - len(suffix.encode("utf-8"))
+        text = _truncate_utf8(text, room).rstrip(" .") + suffix
+    text = text.rstrip(" .")
+    if not text:
+        raise ValueError("The preset name cannot be used as a file name")
     return text
 
 
@@ -1865,34 +2269,65 @@ def _normalized_label(value):
     return " ".join(_text(value).casefold().split())
 
 
-def _compatible_library_parent(inherits, snapshot):
-    """Resolve an OFD parent to a preset compatible with this printer.
+def _is_user_preset(preset):
+    return bool(getattr(preset, "user", False))
 
-    OFD presets inherit catalogue generics such as ``Generic PETG @System``.
-    Printer bundles often shadow those with nozzle-specific generics
-    (``Generic PETG @U1 0.4 nozzle``) and mark the system generic incompatible.
-    Use the compatible same-base/same-material variant instead of refusing the
-    install.
+
+def _root_library_parent(preset, snapshot):
+    """Follow a user preset's ``inherits`` chain to a non-user parent."""
+    seen = set()
+    current = preset
+    for _depth in range(8):
+        if current is None or not _is_user_preset(current):
+            return current
+        name = _text(getattr(current, "name", "")).casefold()
+        if name in seen:
+            return None
+        seen.add(name)
+        inherits = _text((getattr(current, "config", {}) or {}).get("inherits", ""))
+        if not inherits:
+            path = _text(getattr(current, "file", ""))
+            try:
+                data = _read_json_checked(path) if path else {}
+            except (OSError, ValueError):
+                data = {}
+            if isinstance(data, dict):
+                inherits = _text(data.get("inherits"))
+        current = _find_preset(snapshot.get("presets") or [], inherits) \
+            if inherits else None
+    return None
+
+
+def _compatible_library_parent(inherits, snapshot):
+    """Resolve an OFD parent to a system/bundle preset for a local bundle.
+
+    Orca's local-bundle loader cannot resolve a parent that lives in the user
+    preset folder, so a user preset is never returned. Follow user ancestry to
+    a system/bundle root first. OFD presets inherit catalogue generics such as
+    ``Generic PETG @System``; printer bundles often shadow those with
+    nozzle-specific generics (``Generic PETG @U1 0.4 nozzle``) and mark the
+    system generic incompatible, so pick the compatible same-base variant.
     """
     declared = _find_preset(snapshot.get("presets") or [], inherits)
-    if declared is not None and declared.compatible:
+    declared = _root_library_parent(declared, snapshot)
+    if declared is not None and declared.compatible and not _is_user_preset(declared):
         return declared
 
     base = ((getattr(declared, "base", "") if declared is not None else "")
             or _base_name(inherits))
     base_key = _normalized_label(base)
     if not base_key.startswith("generic "):
-        return declared
+        return None if declared is not None and _is_user_preset(declared) else declared
 
     material_key = _normalized_label(
         getattr(declared, "material", "") if declared is not None else "")
     if not material_key and " " in base_key:
         material_key = _normalized_label(base_key.split(" ", 1)[1])
-    printer_nozzle = _normalized_label(snapshot.get("printer_nozzle"))
+    printer_nozzle = _text(snapshot.get("printer_nozzle"))
 
     ranked = []
     for preset in snapshot.get("compatible") or []:
-        if preset is declared:
+        if preset is declared or _is_user_preset(preset):
             continue
         preset_base = (getattr(preset, "base", "") or
                        _base_name(preset.name, preset.bundle_id))
@@ -1901,10 +2336,13 @@ def _compatible_library_parent(inherits, snapshot):
         preset_material = _normalized_label(getattr(preset, "material", ""))
         if material_key and preset_material and preset_material != material_key:
             continue
-        preset_nozzle = _normalized_label(_preset_nozzle(preset.name))
-        if printer_nozzle and preset_nozzle and preset_nozzle != printer_nozzle:
+        preset_nozzle = _preset_nozzle(preset.name)
+        if printer_nozzle and preset_nozzle and not _nozzles_match(
+                preset_nozzle, printer_nozzle):
             continue
-        exact_nozzle = bool(printer_nozzle and preset_nozzle == printer_nozzle)
+        exact_nozzle = bool(
+            printer_nozzle and preset_nozzle and _nozzles_match(
+                preset_nozzle, printer_nozzle))
         ranked.append((
             0 if exact_nozzle else 1 if not preset_nozzle else 2,
             0 if getattr(preset, "system", False) else 1,
@@ -1913,9 +2351,70 @@ def _compatible_library_parent(inherits, snapshot):
             preset,
         ))
     if not ranked:
-        return declared
+        return None if declared is not None and _is_user_preset(declared) else declared
     ranked.sort(key=lambda row: row[:4])
     return ranked[0][4]
+
+
+STANDARD_PRESET_CONFIG_KEYS = {
+    "bed_temperature", "bed_temperature_initial_layer", "chamber_temperature",
+    "cool_plate_temp", "cool_plate_temp_initial_layer",
+    "eng_plate_temp", "eng_plate_temp_initial_layer",
+    "hot_plate_temp", "hot_plate_temp_initial_layer",
+    "textured_plate_temp", "textured_plate_temp_initial_layer",
+    "filament_density", "filament_diameter", "filament_flow_ratio",
+    "filament_max_volumetric_speed", "filament_notes", "filament_cost",
+    "filament_type", "filament_vendor", "filament_colour",
+    "filament_sub_type", "filament_subtype", "filament_settings_id",
+    "filament_ids", "filament_id",
+    "nozzle_temperature", "nozzle_temperature_initial_layer",
+    "nozzle_temperature_range_low", "nozzle_temperature_range_high",
+    "cooling", "slow_down_layer_time", "slow_down_min_speed",
+    "fan_cooling_layer_time", "fan_max_speed", "fan_min_speed",
+    "overhang_fan_speed", "overhang_fan_threshold",
+    "reduce_fan_stop_start_freq", "full_fan_speed_layer",
+    "additional_cooling_fan_speed", "close_fan_the_first_x_layers",
+    "enable_pressure_advance", "pressure_advance",
+    "compatible_printers", "compatible_printers_condition",
+    "compatible_prints", "compatible_prints_condition",
+    "filament_start_gcode", "filament_end_gcode",
+    "during_print_exhaust_fan_speed", "complete_print_exhaust_fan_speed",
+    "activate_air_filtration", "required_nozzle_HRC",
+}
+
+
+def _validate_preset_config_keys(preset, snapshot):
+    """Refuse keys the loaded Orca build cannot parse.
+
+    Orca rejects the whole local bundle reload when one preset contains an
+    unknown config key. Check what the snapshot exposes; the union of preset
+    config_keys() is partial, so a built-in catalog of standard filament
+    options prevents false rejections while still catching plugin/typo keys.
+    """
+    known = {_text(key).casefold() for key in (snapshot.get("config_keys") or [])
+             if _text(key)}
+    if not known and snapshot.get("config_keys_complete") is not True:
+        return
+    known.update(STANDARD_PRESET_CONFIG_KEYS)
+    metadata = set(_PRICE_COPY_METADATA) | {
+        "name", "from", "type", "instantiation", "inherits", "description",
+        "filament_settings_id", "filament_id", "filament_ids", "setting_id",
+        "base_id", "is_system", "system", "bundle_id", "version",
+        # Core filament options every OrcaFilamentLibrary config exposes; a
+        # minimal test/fake key catalog may not list them.
+        "filament_cost", "filament_type", "filament_vendor", "filament_colour",
+        "filament_sub_type", "filament_subtype",
+    }
+    unknown = sorted(
+        _text(key) for key in preset
+        if _text(key) and not _text(key).startswith("_")
+        and _text(key) not in metadata
+        and _text(key).casefold() not in known)
+    if unknown:
+        raise ValueError(
+            'The preset "%s" contains config key(s) this Orca version does not '
+            "know: %s. It was not written." %
+            (_text(preset.get("name")), ", ".join(unknown)))
 
 
 def _validated_library_preset(data, snapshot, warnings):
@@ -1940,6 +2439,7 @@ def _validated_library_preset(data, snapshot, warnings):
         raise ValueError('The library preset "%s" has no "from" field' % name)
     if source.casefold() == "system":
         raise ValueError("System presets cannot be installed as user presets")
+    canonical = _safe_filename(name)
     inherits = _text(preset.get("inherits"))
     if not inherits:
         raise ValueError('The library preset "%s" has no parent (inherits)' % name)
@@ -1965,10 +2465,13 @@ def _validated_library_preset(data, snapshot, warnings):
     if removed:
         _warn(warnings, 'Removed system-only key(s) %s from "%s".' % (", ".join(removed), name))
 
+    wanted = {name.casefold(), canonical.casefold()}
     existing_matches = [
         item for item in (snapshot.get("presets") or [])
-        if item.name.casefold() == name.casefold()
-        or _text(getattr(item, "select_name", "")).casefold() == name.casefold()
+        if item.name.casefold() in wanted
+        or _text(getattr(item, "select_name", "")).casefold() in wanted
+        or _canonical_preset_key(item.name) in
+        {_normalized_label(name), _normalized_label(canonical)}
     ]
     blockers = [item for item in existing_matches if not _is_our_bundle_preset(item)]
     if blockers:
@@ -1980,21 +2483,84 @@ def _validated_library_preset(data, snapshot, warnings):
         raise ValueError(
             'A user preset named "%s" exists. It will not be overwritten.' % name)
 
-    preset["name"] = name
+    # PF-01: the filename stem is the canonical preset name everywhere Orca
+    # and history see it. Keep the unsanitized display name only for warnings
+    # and for a deterministic collision hash at write time.
+    preset["_filament_match_display_name"] = name
+    preset["name"] = canonical
     preset["from"] = source
     preset["type"] = "filament"
     preset["instantiation"] = "true"
     preset.setdefault("version", PLUGIN_VERSION)
-    preset["filament_settings_id"] = [name]
+    preset["filament_settings_id"] = [canonical]
+    _validate_preset_config_keys(preset, snapshot)
     return preset
 
 
+def _file_bytes(path):
+    try:
+        with open(path, "rb") as stream:
+            return stream.read()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+
+
+def _write_bytes_atomic(path, payload):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix="." + os.path.basename(path) + ".", suffix=".tmp", dir=directory)
+    os.close(descriptor)
+    try:
+        with open(temporary, "wb") as stream:
+            stream.write(payload)
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def _restore_local_file(path, backup):
+    if backup is None:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        return
+    _write_bytes_atomic(path, backup)
+
+
+def _reload_local_bundle():
+    try:
+        orca.host.preset.bundles.reload_local(BUNDLE_ID)
+    except Exception as error:
+        raise RuntimeError(_error_text(error))
+
+
 def _write_local_preset(preset, snapshot):
-    """Write one preset into the plugin's local bundle and reload it."""
+    """Write one preset into the plugin's local bundle and reload it.
+
+    The target is backed up first. If Orca cannot reload the bundle, the file
+    (or its previous contents) is restored before the error is reported, so a
+    failed install never leaves a half-valid preset that breaks the bundle.
+    """
+    preset = dict(preset)
     name = _text(preset.get("name"))
+    display_name = _text(preset.pop("_filament_match_display_name", "")) or name
     data_dir = _text(snapshot.get("data_dir"))
     folder = _text(snapshot.get("folder"))
-    if not snapshot.get("folder_inferred") or not folder:
+    if not folder or not snapshot.get("folder_inferred"):
+        discovered, _why = _discover_user_folder(data_dir, preferred=folder)
+        if discovered:
+            folder = discovered
+            snapshot["folder"] = discovered
+            snapshot["folder_inferred"] = True
+    if not folder or not snapshot.get("folder_inferred"):
         raise RuntimeError(
             "Could not determine the active Orca user profile folder from a loaded user or "
             "local-bundle preset. Save one user preset in Orca (or select one), press "
@@ -2003,27 +2569,75 @@ def _write_local_preset(preset, snapshot):
         raise RuntimeError(
             "Could not find Orca's data folder from the loaded presets. Open a user "
             "preset in Orca first, or restart Orca with a user profile loaded.")
+    if folder in (".", "..") or "/" in folder or "\\" in folder:
+        raise RuntimeError("Orca returned an unsafe user profile folder: %s" % folder)
     user_root = os.path.join(data_dir, "user")
     if not os.path.isdir(user_root):
         raise RuntimeError("Orca's user preset folder was not found at %s" % user_root)
 
     bundle_dir = os.path.join(user_root, folder, "_local", BUNDLE_ID)
     filament_dir = os.path.join(bundle_dir, "filament")
-    target = os.path.join(filament_dir, _safe_filename(name) + ".json")
+    canonical = _safe_filename(display_name)
+    target = os.path.join(filament_dir, canonical + ".json")
+
+    if os.path.exists(target):
+        try:
+            existing = _read_json_checked(target)
+        except (OSError, ValueError) as error:
+            raise RuntimeError(
+                'Refusing to overwrite the local preset at %s because it is not '
+                "valid JSON: %s" % (target, _error_text(error)))
+        existing_name = _text(existing.get("name")) if isinstance(existing, dict) else ""
+        if not existing_name:
+            raise RuntimeError(
+                'Refusing to overwrite the local preset at %s because it has no '
+                "preset name (the file may be corrupt)." % target)
+        if existing_name != canonical and \
+                _canonical_preset_key(existing_name) != \
+                _canonical_preset_key(canonical):
+            # Two distinct display names sanitized to the same stem. Add a
+            # stable discriminator instead of overwriting the existing file.
+            canonical = _safe_filename(display_name, salt=existing_name)
+            target = os.path.join(filament_dir, canonical + ".json")
+
+    preset["name"] = canonical
+    preset["filament_settings_id"] = [canonical]
+    _validate_preset_config_keys(preset, snapshot)
+    existed_before = os.path.isdir(bundle_dir)
+    metadata_path = os.path.join(bundle_dir, "bundle_metadata.json")
+    target_backup = _file_bytes(target)
+    metadata_backup = _file_bytes(metadata_path)
     _write_json_atomic(target, preset)
-    _write_json_atomic(os.path.join(bundle_dir, "bundle_metadata.json"), {
+    _write_json_atomic(metadata_path, {
         "id": BUNDLE_ID,
         "name": BUNDLE_NAME,
         "version": PLUGIN_VERSION,
     })
 
     try:
-        orca.host.preset.bundles.reload_local(BUNDLE_ID)
+        _reload_local_bundle()
     except Exception as error:
+        try:
+            _restore_local_file(target, target_backup)
+            _restore_local_file(metadata_path, metadata_backup)
+            if not existed_before:
+                shutil.rmtree(bundle_dir, ignore_errors=True)
+            try:
+                _reload_local_bundle()
+            except Exception:
+                # The restored state is already correct; a second failure here
+                # must not mask the original reload error.
+                pass
+        except Exception as rollback_error:
+            raise RuntimeError(
+                'The preset was written to %s but Orca could not reload the bundle '
+                "(%s), and rollback also failed: %s" %
+                (bundle_dir, _error_text(error), _error_text(rollback_error)))
         raise RuntimeError(
-            'The preset was written to %s but Orca could not reload the bundle: %s'
-            % (bundle_dir, _error_text(error)))
-    return name
+            'Orca could not reload the local preset bundle after writing "%s": %s. '
+            "The previous preset file was restored." %
+            (canonical, _error_text(error)))
+    return canonical
 
 
 def _install_library_preset(candidate, snapshot, settings, storage, session,
@@ -2042,28 +2656,138 @@ def _strip_local_suffix(value):
     return re.sub(r"\s*\(local\)\s*$", "", _text(value), flags=re.I).strip()
 
 
-def _price_copy_name(preset, snapshot):
-    """A unique local price-copy name such as ``eSUN PETG (local)``."""
+def _local_copy_index(snapshot):
+    """Existing plugin copies on disk: folded name -> {name, inherits, file}."""
+    data_dir = _text(snapshot.get("data_dir"))
+    folder = _text(snapshot.get("folder"))
+    result = {}
+    if not data_dir or not folder:
+        return result
+    directory = os.path.join(
+        data_dir, "user", folder, "_local", BUNDLE_ID, "filament")
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return result
+    for filename in names:
+        if not filename.lower().endswith(".json"):
+            continue
+        path = os.path.join(directory, filename)
+        data = _read_json(path, {})
+        if not isinstance(data, dict):
+            continue
+        name = _text(data.get("name")) or filename[:-5]
+        result[name.casefold()] = {
+            "name": name,
+            "inherits": _text(data.get("inherits")),
+            "file": path,
+        }
+    return result
+
+
+def _price_copy_source(preset):
+    """Stable identity of the preset a price copy was made from."""
+    name = _text(getattr(preset, "name", ""))
+    if name:
+        return name
+    return _base_name(getattr(preset, "base", ""))
+
+
+def _price_copy_identity(value):
+    """Full source identity, keeping @printer/nozzle so variants differ."""
+    text = _text(value)
+    match = re.match(r"^_(?:local|subscribed)/[^/]+/", text, re.I)
+    if match:
+        text = text[match.end():]
+    try:
+        text = _safe_filename(text)
+    except ValueError:
+        pass
+    return _normalized_label(text)
+
+
+def _price_copy_name(preset, snapshot, created=None):
+    """A unique local price-copy name such as ``eSUN PETG (local)``.
+
+    The name is keyed by the full source preset, not just the display base, so
+    two nozzle variants, two vendors with the same base, or two slots in one
+    Apply batch cannot overwrite one another. An existing copy of the *same*
+    source is reused (pressing Save price again updates it).
+    """
+    source = _price_copy_source(preset)
     base = _strip_local_suffix(
         getattr(preset, "base", "") or
-        _base_name(getattr(preset, "name", ""), preset.bundle_id)) or "Filament"
+        _base_name(source, getattr(preset, "bundle_id", ""))) or "Filament"
     presets = snapshot.get("presets") or []
+    copies = _local_copy_index(snapshot)
+    created = created if isinstance(created, dict) else {}
+    source_identity = _price_copy_identity(source)
+    source_is_user = bool(getattr(preset, "user", False))
+    base_key = _normalized_label(base)
+    has_sibling = any(
+        item is not preset and not _is_our_bundle_preset(item)
+        and _normalized_label(
+            _strip_local_suffix(getattr(item, "base", "") or
+                                _base_name(getattr(item, "name", ""),
+                                           getattr(item, "bundle_id", "")))) == base_key
+        for item in (snapshot.get("compatible") or presets))
 
-    def taken(name):
+    def matches_source(inherits, source_name):
+        return _price_copy_identity(inherits) == _price_copy_identity(source_name)
+
+    def taken(name, source_name, discriminated):
         folded = name.casefold()
-        matches = [
-            item for item in presets
-            if item.name.casefold() == folded or
-            _text(getattr(item, "select_name", "")).casefold() == folded
-        ]
-        return any(not _is_our_bundle_preset(item) for item in matches)
+        for item in presets:
+            if item.name.casefold() == folded or \
+                    _text(getattr(item, "select_name", "")).casefold() == folded:
+                if not _is_our_bundle_preset(item):
+                    return True
+                if discriminated:
+                    # The name already contains this source's discriminator.
+                    continue
+                inherits = _text((getattr(item, "config", {}) or {}).get(
+                    "inherits", ""))
+                if source_is_user:
+                    # A flattened user copy inherits the system root, which is
+                    # not the source name; without a same-base sibling there is
+                    # nothing else this plain name could belong to.
+                    continue
+                if not matches_source(inherits, source_name):
+                    return True
+        entry = copies.get(folded)
+        if entry is not None:
+            if discriminated:
+                pass
+            elif source_is_user:
+                pass
+            elif not matches_source(entry["inherits"], source_name):
+                return True
+        previous = created.get(folded)
+        if previous is not None and _price_copy_identity(previous) != \
+                _price_copy_identity(source_name):
+            return True
+        return False
 
-    candidate = "%s (local)" % base
-    if not taken(candidate):
-        return candidate
-    for number in range(2, 100):
-        candidate = "%s %d (local)" % (base, number)
-        if not taken(candidate):
+    plain = "%s (local)" % base
+    digest = hashlib.sha1(source_identity.encode("utf-8")).hexdigest()[:6]
+    nozzle = _preset_nozzle(source)
+    tag = ("%s %s" % (nozzle, digest)) if nozzle else digest
+    discriminated = "%s (%s local)" % (base, tag)
+    if has_sibling:
+        # Same-base variants: the first system copy may keep the friendly
+        # name (its inherits identifies it), later ones get a deterministic
+        # per-source discriminator. User copies inherit the system root, so
+        # they always use the discriminator when a sibling exists.
+        candidates = ([plain] if not source_is_user else []) + [discriminated]
+    else:
+        candidates = [plain]
+        if nozzle:
+            candidates.append("%s (%s nozzle, local)" % (base, nozzle))
+        candidates.append(discriminated)
+        candidates.extend("%s %d (local)" % (base, number)
+                          for number in range(2, 100))
+    for candidate in candidates:
+        if not taken(candidate, source, discriminated=candidate != plain):
             return candidate
     raise RuntimeError('Could not create a unique local price preset for "%s"' % base)
 
@@ -2075,6 +2799,15 @@ _PRICE_COPY_METADATA = {
 }
 
 
+def _preset_live_values(preset):
+    config = getattr(preset, "config", None)
+    if isinstance(config, dict):
+        values = config.get("values")
+        if isinstance(values, dict):
+            return dict(values)
+    return {}
+
+
 def _flatten_user_preset(preset, snapshot, depth=0, seen=None):
     """Return a user preset's config and its first non-user parent.
 
@@ -2082,39 +2815,65 @@ def _flatten_user_preset(preset, snapshot, depth=0, seen=None):
     points into the user preset folder; it logs "can not find parent" and skips
     the file. For a price copy of a user preset, flatten the user ancestry into
     the copy and inherit only the system/other parent.
+
+    Live preset values win over the file so unsaved edits are copied. A cloud
+    preset with no readable file still works from its live values; if neither
+    exists, fail loudly instead of silently dropping the user's settings.
     """
     if depth > 8:
-        return {}, ""
+        raise RuntimeError(
+            'The user preset "%s" has a parent chain deeper than 8 levels.' %
+            _text(getattr(preset, "name", "")))
     seen = set(seen or ())
     path = _text(getattr(preset, "file", ""))
-    data = _read_json(path, {})
-    if not isinstance(data, dict):
-        data = {}
+    live = _preset_live_values(preset)
+    data = {}
+    read_error = ""
+    if path:
+        try:
+            loaded = _read_json_checked(path)
+            if isinstance(loaded, dict):
+                data = loaded
+            else:
+                read_error = "the JSON root is not an object"
+        except (OSError, ValueError) as error:
+            read_error = _error_text(error)
+    else:
+        read_error = "the preset has no file path"
+    if not data and not live:
+        raise RuntimeError(
+            'Could not read the user preset "%s"%s: %s. The price copy was not '
+            "created; re-save the preset in Orca and try again." %
+            (_text(getattr(preset, "name", "")),
+             (" at %s" % path) if path else "", read_error or "no settings found"))
+    merged = dict(data)
+    merged.update(live)
     name_key = _text(getattr(preset, "name", "")).casefold()
     seen.add(name_key)
-    parent_name = _text(data.get("inherits"))
+    parent_name = _text(merged.get("inherits"))
     parent = _find_preset(snapshot.get("presets") or [], parent_name) \
         if parent_name else None
     if (parent is not None and parent.user
             and _text(parent.name).casefold() not in seen):
         parent_data, root = _flatten_user_preset(
             parent, snapshot, depth + 1, seen)
-        merged = dict(parent_data)
-        merged.update(data)
-        return merged, root
-    return data, parent_name
+        combined = dict(parent_data)
+        combined.update(merged)
+        return combined, root
+    return merged, parent_name
 
 
 def _user_price_copy_data(preset, copy_name, price, snapshot):
     flat, root_name = _flatten_user_preset(preset, snapshot)
     root = _find_preset(snapshot.get("presets") or [], root_name) \
         if root_name else None
-    if root is None or not root.compatible:
+    root = _root_library_parent(root, snapshot)
+    if root is None or not root.compatible or _is_user_preset(root):
         material = _text(getattr(preset, "material", "")) or _text(
             _first(flat.get("filament_type")))
         root = _compatible_library_parent(
             "Generic %s @System" % material, snapshot) if material else None
-    if root is None or not root.compatible:
+    if root is None or not root.compatible or _is_user_preset(root):
         raise RuntimeError(
             'Could not find a compatible parent for the user preset "%s".' %
             _text(getattr(preset, "name", "")))
@@ -2143,9 +2902,9 @@ def _user_price_copy_data(preset, copy_name, price, snapshot):
     return data
 
 
-def _create_price_copy(preset, price, snapshot, warnings):
+def _create_price_copy(preset, price, snapshot, warnings, created=None):
     """Create or replace a local ``(local)`` copy of a non-plugin preset."""
-    copy_name = _price_copy_name(preset, snapshot)
+    copy_name = _price_copy_name(preset, snapshot, created=created)
     if getattr(preset, "user", False):
         data = _user_price_copy_data(preset, copy_name, price, snapshot)
     else:
@@ -2165,29 +2924,54 @@ def _create_price_copy(preset, price, snapshot, warnings):
             data["filament_colour"] = [preset.color]
     validated = _validated_library_preset(data, snapshot, warnings)
     validated["filament_cost"] = [price]
-    return _write_local_preset(validated, snapshot)
+    written = _write_local_preset(validated, snapshot)
+    if isinstance(created, dict):
+        created[written.casefold()] = _price_copy_source(preset)
+    return written
 
 
 def _update_local_preset_price(preset, price, warnings):
-    """Set filament_cost in a plugin-owned local preset JSON and reload it."""
+    """Set filament_cost in a plugin-owned local preset JSON and reload it.
+
+    A failed reload restores the exact previous file bytes, so a price update
+    can never leave the bundle in the state Orca just rejected.
+    """
     path = _text(getattr(preset, "file", ""))
     if not path or not os.path.isfile(path):
         raise RuntimeError(
             'The local preset "%s" has no readable JSON file to update.' %
             _text(getattr(preset, "name", "")))
-    data = _read_json(path, {})
+    try:
+        data = _read_json_checked(path)
+    except (OSError, ValueError) as error:
+        raise RuntimeError(
+            'Refusing to update the local preset "%s": %s' %
+            (_text(getattr(preset, "name", "")), _error_text(error)))
     if not isinstance(data, dict) or not data:
         raise RuntimeError(
             'The local preset "%s" could not be read.' %
             _text(getattr(preset, "name", "")))
+    backup = _file_bytes(path)
     data["filament_cost"] = [price]
     _write_json_atomic(path, data)
     try:
-        orca.host.preset.bundles.reload_local(BUNDLE_ID)
+        _reload_local_bundle()
     except Exception as error:
+        try:
+            _restore_local_file(path, backup)
+            try:
+                _reload_local_bundle()
+            except Exception:
+                pass
+        except Exception as rollback_error:
+            raise RuntimeError(
+                'The price was written to %s but Orca could not reload the bundle '
+                "(%s), and rollback failed: %s" %
+                (path, _error_text(error), _error_text(rollback_error)))
         raise RuntimeError(
-            'The price was written to %s but Orca could not reload the bundle: %s'
-            % (path, _error_text(error)))
+            'Orca could not reload the local preset bundle after updating the '
+            'price in "%s": %s. The previous file was restored.' %
+            (_text(getattr(preset, "name", "")), _error_text(error)))
     return True
 
 
@@ -2211,7 +2995,8 @@ def _select_slot(slot, name):
             "Orca rejected the preset for slot %s: %s" % (slot, _error_text(error)))
 
 
-def _apply_selection(message, snapshot, settings, storage, session, warnings):
+def _apply_selection(message, snapshot, settings, storage, session, warnings,
+                     created=None):
     slot = int(message.get("slot") or 0)
     if slot < 1:
         raise ValueError("Invalid slot number")
@@ -2241,9 +3026,9 @@ def _apply_selection(message, snapshot, settings, storage, session, warnings):
         label = _install_library_preset(
             candidate, snapshot, settings, storage, session, warnings,
             price=price)
-        # After reload_local, a bundle preset's internal Preset.name is
-        # _local/<bundle>/<base>; the selector label is the base name. Store
-        # the internal form in history so the next session can resolve it.
+        # PF-01: _write_local_preset returns the canonical (sanitized) stem.
+        # The filename, JSON name, filament_settings_id, selector and history
+        # all use that one value; the unsanitized display name is not stored.
         name = "_local/%s/%s" % (BUNDLE_ID, label)
         source = "library"
         select_name = label
@@ -2278,7 +3063,7 @@ def _apply_selection(message, snapshot, settings, storage, session, warnings):
                 # System and user presets cannot be saved through the plugin
                 # API. Create a local copy so the price survives restarts.
                 copy_name = _create_price_copy(
-                    preset, price, snapshot, warnings)
+                    preset, price, snapshot, warnings, created=created)
                 name = "_local/%s/%s" % (BUNDLE_ID, copy_name)
                 select_name = copy_name
                 price_copy = True
@@ -2423,6 +3208,7 @@ details.settings > summary { cursor: pointer; padding: 8px 0; color: var(--muted
   <span id="status"></span>
   <button class="primary" id="apply" title="Apply the selected presets to Orca" disabled>Apply</button>
   <button class="icon" id="rescan" title="Scan printer again" aria-label="Scan printer again">↻</button>
+  <button id="refreshPresets" title="Reload Orca's preset list and the active user folder">Refresh presets</button>
 </div>
 
 <div id="mismatch" class="mismatch" hidden></div>
@@ -2474,6 +3260,7 @@ details.settings > summary { cursor: pointer; padding: 8px 0; color: var(--muted
 'use strict';
 const $ = id => document.getElementById(id);
 let state = { settings: {}, presets: [], rows: [], connection: {}, slots: [], busy: false, mismatch: null,
+  feeders: 0, feedersKnown: true,
   spoolman: { available: false, message: 'Add a Spoolman URL in Settings to fetch prices.' } };
 let nextRid = 1;
 let detailSlot = 0;
@@ -2481,6 +3268,99 @@ let chooserSlot = 0;
 
 const esc = value => String(value ?? '').replace(/[&<>"']/g,
   c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+// #region FM_STATE_HELPERS
+// Pure row-state helpers. Kept free of DOM/state access so the Node test in
+// test_entry_static.py exercises the same logic the page runs.
+function fmStripPrefix(value) {
+  let text = String(value ?? '').trim();
+  const prefix = text.match(/^_(?:local|subscribed)\/[^/]+\//i);
+  if (prefix) text = text.slice(prefix[0].length);
+  return text;
+}
+function fmPresetKey(value) {
+  return fmStripPrefix(value).replace(/\s+@[^@]*$/, '').trim().toLowerCase()
+    .replace(/\s+/g, ' ');
+}
+function fmSelectedValue(row) {
+  row = row || {};
+  if (row.choose) return '';
+  const name = String(row.preset_name || '');
+  if (name) return name;
+  if (row.error) return '';
+  const candidates = row.candidates || [];
+  if (!candidates.length) return '';
+  const candidate = candidates[0] || {};
+  const candidateName = String(candidate.preset_name || '');
+  if (!candidateName) return '';
+  return candidate.source === 'library' ? 'lib:' + candidateName : candidateName;
+}
+function fmIsApplied(row) {
+  row = row || {};
+  if (row.user_applied) return false;
+  const current = fmPresetKey(row.current_name || row.current || '');
+  const selected = fmPresetKey(row.preset_name || '');
+  return !!(current && selected && current === selected);
+}
+function fmRowDirty(row) {
+  row = row || {};
+  if (!row.selected || row.choose || row.user_applied) return false;
+  return !fmIsApplied(row);
+}
+function fmRowApplyable(row) {
+  row = row || {};
+  return !!(row.selected && row.dirty && !row.pending && !row.choose &&
+    row.slot_exists !== false);
+}
+function fmApplyCount(rows) {
+  return (rows || []).filter(fmRowApplyable).length;
+}
+function fmPriceStageKey(row) {
+  row = row || {};
+  const identity = String(row.identity || '');
+  let preset = String(row.selected ?? '');
+  if (preset.startsWith('lib:')) preset = preset.slice(4);
+  preset = fmPresetKey(preset);
+  return identity && preset ? identity + '|' + preset : '';
+}
+function fmStatusFor(row) {
+  row = row || {};
+  if (row.apply_error) return {kind: 'err', text: row.apply_error};
+  if (row.pending) return {kind: 'warn', text: 'Applying…'};
+  if (row.slot_exists === false) {
+    return {kind: 'err', text: 'No Orca slot — add filament slot(s) in Orca'};
+  }
+  if (row.error) return {kind: 'err', text: row.error};
+  const candidates = row.candidates || [];
+  if (row.choose || (!row.selected && candidates.length > 1)) {
+    return {kind: 'warn', text: 'Multiple matches — pick one, then Apply'};
+  }
+  if (!row.selected) {
+    if (row.source === 'library' && candidates.length) {
+      return {kind: 'warn', text: 'Library match — press Apply to install'};
+    }
+    return {kind: 'err', text: 'No match'};
+  }
+  const source = row.selected.startsWith('lib:') ? 'library' : (row.source || '');
+  if (row.user_applied) return {kind: 'ok', text: 'Applied'};
+  if (fmIsApplied(row) || row.applied) return {kind: 'ok', text: 'Already in slot'};
+  if (source === 'library') {
+    return {kind: 'warn', text: 'Library match — press Apply to install'};
+  }
+  if (source === 'generic') {
+    return {kind: 'warn', text: 'Generic fallback — no vendor preset matched'};
+  }
+  if (row.dirty) return {kind: 'warn', text: 'Selected — press Apply'};
+  return {kind: 'ok', text: 'Matched'};
+}
+function fmApplyErrorState(row) {
+  row = row || {};
+  row.pending = false;
+  row.price_pending = false;
+  row.dirty = fmRowDirty(row);
+  return row;
+}
+// #endregion FM_STATE_HELPERS
 
 function status(text, kind) {
   const node = $('status');
@@ -2495,8 +3375,7 @@ function readSettings() {
   };
 }
 function applyCount() {
-  return state.rows.filter(row => row.selected && row.dirty && !row.pending &&
-    row.slot_exists !== false).length;
+  return fmApplyCount(state.rows);
 }
 function updateApplyButton() {
   const count = applyCount();
@@ -2506,6 +3385,7 @@ function updateApplyButton() {
 function setBusy(value) {
   state.busy = value;
   $('rescan').disabled = value;
+  $('refreshPresets').disabled = value;
   $('save').disabled = value;
   $('clearCache').disabled = value;
   $('apply').disabled = value || !applyCount();
@@ -2557,13 +3437,8 @@ function readForm(slot) {
 }
 function applyRowState(row) {
   row.form = observationForm(row.observation || {});
-  row.selected = row.preset_name || '';
-  if (!row.selected && !row.error && (row.candidates || []).length) {
-    const candidate = row.candidates[0];
-    row.selected = row.source === 'library'
-      ? 'lib:' + (candidate.preset_name || '')
-      : (candidate.preset_name || '');
-  }
+  row.selected = fmSelectedValue(row);
+  row.price_key = fmPriceStageKey(row);
   row.expanded = !!row.expanded;
   row.detail = null;
   row.detailLoading = false;
@@ -2579,31 +3454,12 @@ function applyRowState(row) {
   row.price_touched = !!row.price_touched;
   row.price_pending = !!row.price_pending;
   row.price_error = row.price_error || '';
-  row.dirty = !!(row.selected && !row.user_applied);
+  row.applied = fmIsApplied(row);
+  row.dirty = fmRowDirty(row);
   return row;
 }
 function statusFor(row) {
-  if (row.apply_error) return {kind: 'err', text: row.apply_error};
-  if (row.pending) return {kind: 'warn', text: 'Applying…'};
-  if (row.slot_exists === false) {
-    return {kind: 'err', text: 'No Orca slot — add filament slot(s) in Orca'};
-  }
-  if (row.error) return {kind: 'err', text: row.error};
-  if (row.choose) return {kind: 'warn', text: 'Multiple matches — pick one, then Apply'};
-  if (row.source === 'library' && (row.candidates || []).length) {
-    return {kind: 'warn', text: row.dirty
-      ? 'Library match — press Apply to install' : 'Library match'};
-  }
-  if (row.preset_name) {
-    if (row.user_applied) return {kind: 'ok', text: 'Applied'};
-    if (row.applied) return {kind: 'ok', text: 'Already in slot'};
-    if (row.source === 'generic') {
-      return {kind: 'warn', text: 'Generic fallback — no vendor preset matched'};
-    }
-    if (row.dirty) return {kind: 'warn', text: 'Selected — press Apply'};
-    return {kind: 'ok', text: 'Matched'};
-  }
-  return {kind: 'err', text: 'No match'};
+  return fmStatusFor(row);
 }
 function presetOptions(row) {
   const groups = [['user', 'Your presets'], ['bundle', 'Local bundles'],
@@ -2717,6 +3573,11 @@ function renderFeed(row) {
     '" title="Edit preset" aria-label="Edit preset"' + (row.selected ? '' : ' disabled') + '>✎</button>';
   html += '<button class="icon" data-action="expand" data-slot="' + slot +
     '" title="Matching fields" aria-label="Matching fields">' + (row.expanded ? '▾' : '▸') + '</button>';
+  html += '<button class="icon" data-action="' + (row.ignored ? 'unmute' : 'mute') +
+    '" data-slot="' + slot + '" title="' +
+    (row.ignored ? 'Unmute this filament identity' : 'Mute this filament identity') +
+    '" aria-label="' + (row.ignored ? 'Unmute' : 'Mute') + '">' +
+    (row.ignored ? '🔇' : '🔈') + '</button>';
   html += '</div>';
   const info = statusFor(row);
   html += '<div class="feed-status ' + info.kind + '">' + esc(info.text) + '</div>';
@@ -2752,11 +3613,14 @@ function updateRow(row) {
   const prepared = applyRowState(row);
   if (previous) {
     prepared.expanded = !!previous.expanded;
-    prepared.new_price = previous.new_price;
-    prepared.price_touched = previous.price_touched;
-    prepared.price_pending = previous.selected === prepared.selected
-      ? previous.price_pending : false;
-    prepared.price_error = previous.price_error;
+    const sameStage = previous.price_key === prepared.price_key;
+    prepared.new_price = sameStage
+      ? previous.new_price
+      : (prepared.spool_price == null || prepared.spool_price === ''
+        ? '' : String(prepared.spool_price));
+    prepared.price_touched = sameStage ? previous.price_touched : false;
+    prepared.price_pending = sameStage ? previous.price_pending : false;
+    prepared.price_error = sameStage ? previous.price_error : '';
   }
   if (index >= 0) state.rows[index] = prepared; else state.rows.push(prepared);
   state.rows.sort((a, b) => Number(a.slot) - Number(b.slot));
@@ -2765,18 +3629,29 @@ function updateRow(row) {
 function choosePreset(slot, value) {
   const row = rowBySlot(slot);
   if (!row) return;
+  const previousKey = fmPriceStageKey(row);
   const info = selectedInfo(row, value);
   row.selected = value || '';
+  row.preset_name = value ? (info.preset_name || '') : '';
+  row.select_name = row.preset_name;
+  row.source = value ? info.source : '';
   row.apply_error = '';
   row.pending = false;
-  row.applied = false;
   row.user_applied = false;
   row.choose = false;
   if (value) row.error = '';
   row.current_price = value ? (info.price || '') : '';
-  row.price_pending = false;
+  row.applied = fmIsApplied(row);
+  row.dirty = fmRowDirty(row);
+  const stageKey = fmPriceStageKey(row);
+  if (stageKey !== previousKey) {
+    row.new_price = row.spool_price == null || row.spool_price === ''
+      ? '' : String(row.spool_price);
+    row.price_touched = false;
+    row.price_pending = false;
+  }
+  row.price_key = stageKey;
   row.price_error = '';
-  row.dirty = !!value;
   renderRows();
   if (!value) { status('No preset selected.', 'info'); return; }
   status('T' + slot + ': selected ' +
@@ -2785,8 +3660,7 @@ function choosePreset(slot, value) {
 }
 function applyAll() {
   if (state.busy) return;
-  const entries = state.rows.filter(row => row.selected && row.dirty &&
-      row.slot_exists !== false)
+  const entries = state.rows.filter(fmRowApplyable)
     .map(row => {
       const info = selectedInfo(row, row.selected);
       return {
@@ -2797,7 +3671,9 @@ function applyAll() {
       };
     });
   if (!entries.length) {
-    if (state.mismatch && state.mismatch.missing_slots) {
+    if (state.rows.some(row => row.choose)) {
+      status('Choose a preset for every ambiguous feed, then press Apply.', 'warn');
+    } else if (state.mismatch && state.mismatch.missing_slots) {
       status(state.mismatch.message, 'warn');
     } else {
       status('Nothing to apply — select at least one preset.', 'info');
@@ -2805,7 +3681,11 @@ function applyAll() {
     return;
   }
   status('Applying ' + entries.length + ' feed(s)…', 'info');
-  post('apply_all', {entries: entries, feeders: state.rows.length});
+  post('apply_all', {
+    entries: entries,
+    feeders: state.feeders || state.rows.length,
+    feeders_known: state.feedersKnown
+  });
 }
 function configTable(pairs) {
   if (!pairs || !pairs.length) return '<p class="dim">No own settings.</p>';
@@ -2871,10 +3751,8 @@ function openChooser(slot) {
       '<div class="cand-text"><div class="cand-name">' + esc(cand.select_name || cand.preset_name) + '</div>' +
       '<div class="cand-meta">' + esc(meta || '—') + '</div></div></label>';
   }).join('');
-  if (!$('chooserList').querySelector('input:checked')) {
-    const first = $('chooserList').querySelector('input');
-    if (first) first.checked = true;
-  }
+  // Ambiguous matches require an explicit pick: never preselect the first
+  // candidate (that used to make Apply silently install candidate 1).
   $('chooser').hidden = false;
 }
 function closeChooser() {
@@ -2885,7 +3763,10 @@ function pickChooser() {
   const row = rowBySlot(chooserSlot);
   if (!row) { closeChooser(); return; }
   const checked = document.querySelector('#chooserList input[name="chooser"]:checked');
-  if (!checked) { closeChooser(); return; }
+  if (!checked) {
+    status('Pick one of the candidate presets first.', 'warn');
+    return;
+  }
   const candidates = (row.candidates || []).filter(cand => cand.preset_name);
   const cand = candidates[Number(checked.value)];
   if (!cand) { closeChooser(); return; }
@@ -2917,6 +3798,16 @@ function fetchPrice(slot) {
     slot: Number(slot), observation: values
   });
 }
+function muteRow(slot, mute) {
+  const row = rowBySlot(slot);
+  if (!row) return;
+  if (!row.identity) {
+    status('This feed has no filament identity to mute.', 'err');
+    return;
+  }
+  status(mute ? 'Muting this filament identity…' : 'Unmuting…', 'info');
+  post(mute ? 'mute' : 'unmute', {identity: row.identity});
+}
 function savePrice(slot) {
   const row = rowBySlot(slot);
   if (!row) return;
@@ -2935,6 +3826,7 @@ function savePrice(slot) {
   row.current_price = value;
   row.price_pending = true;
   row.price_touched = true;
+  row.price_key = fmPriceStageKey(row);
   row.dirty = true;
   row.price_error = '';
   renderRows();
@@ -2952,6 +3844,8 @@ $('rows').addEventListener('click', event => {
   else if (action === 'match') matchRow(slot);
   else if (action === 'fetch-price') fetchPrice(slot);
   else if (action === 'save-price') savePrice(slot);
+  else if (action === 'mute') muteRow(slot, true);
+  else if (action === 'unmute') muteRow(slot, false);
 });
 $('rows').addEventListener('change', event => {
   const select = event.target.closest('select[data-role="preset"]');
@@ -2975,8 +3869,17 @@ $('rows').addEventListener('input', event => {
   const input = event.target.closest('[data-field]');
   if (!input) return;
   const row = rowBySlot(input.dataset.slot);
+  const previousSpool = row ? String(row.form[input.dataset.field] ?? '') : '';
   if (row) row.form[input.dataset.field] = input.value;
   if (input.dataset.field === 'spool_id') {
+    if (row && input.value !== previousSpool) {
+      // A staged price belongs to the old spool; never apply it to a new one.
+      row.new_price = '';
+      row.price_pending = false;
+      row.price_touched = false;
+      row.price_key = '';
+      row.price_error = '';
+    }
     const fetch = document.querySelector(
       'button[data-action="fetch-price"][data-slot="' + input.dataset.slot + '"]');
     const wrap = fetch ? fetch.closest('.price-btn-wrap') : null;
@@ -2997,6 +3900,11 @@ $('rescan').onclick = () => {
   if (state.busy) return;
   status('Scanning printer…', 'info');
   post('scan');
+};
+$('refreshPresets').onclick = () => {
+  if (state.busy) return;
+  status('Refreshing presets…', 'info');
+  post('refresh');
 };
 $('save').onclick = () => {
   status('Saving…', 'info');
@@ -3048,6 +3956,7 @@ function markRowApplied(applied) {
     row.price_touched = false;
     row.price_error = '';
   }
+  row.price_key = fmPriceStageKey(row);
   row.dirty = false;
 }
 
@@ -3061,9 +3970,12 @@ orca.onMessage(message => {
     } else if (message.slot) {
       const row = rowBySlot(message.slot);
       if (row) {
+        const fallback = row.current_name || row.preset_name || '';
         row.apply_error = message.error;
-        row.pending = false;
-        row.selected = row.current_name || row.preset_name || '';
+        row.selected = fallback;
+        row.preset_name = row.current_name || row.preset_name || '';
+        row.price_pending = false;
+        fmApplyErrorState(row);
         renderRows();
       }
     }
@@ -3115,19 +4027,25 @@ orca.onMessage(message => {
   if (message.scan) {
     state.mismatch = message.slot_mismatch || null;
     state.spoolman = message.spoolman || state.spoolman;
+    state.feeders = message.feeders == null
+      ? (message.scan || []).length : Number(message.feeders);
+    state.feedersKnown = message.feeders_known !== false;
     const previousRows = new Map(
       state.rows.map(row => [Number(row.slot), row]));
     state.rows = (message.scan || []).map(raw => {
       const row = applyRowState(raw);
       const old = previousRows.get(Number(row.slot));
       if (old) {
-        row.new_price = old.price_touched
-          ? old.new_price
-          : (row.spool_price !== '' ? String(row.spool_price) : old.new_price);
-        row.price_touched = old.price_touched;
-        row.price_pending = old.selected === row.selected
-          ? old.price_pending : false;
-        row.price_error = old.price_error;
+        const sameStage = old.price_key === row.price_key;
+        row.new_price = sameStage
+          ? (old.price_touched
+            ? old.new_price
+            : (row.spool_price !== '' ? String(row.spool_price) : old.new_price))
+          : (row.spool_price == null || row.spool_price === ''
+            ? '' : String(row.spool_price));
+        row.price_touched = sameStage ? old.price_touched : false;
+        row.price_pending = sameStage ? old.price_pending : false;
+        row.price_error = sameStage ? old.price_error : '';
       }
       return row;
     });
@@ -3136,7 +4054,7 @@ orca.onMessage(message => {
     const present = state.rows.filter(row =>
       !row.observation || row.observation.present !== false).length;
     const issues = state.rows.filter(row => row.error || row.apply_error || row.choose).length;
-    const pending = state.rows.filter(row => row.selected && row.dirty).length;
+    const pending = applyCount();
     let text = message.message || ('Matched ' + present + ' feed(s).');
     if (pending) text += ' Press Apply to set ' + pending + ' feed(s) in Orca.';
     const warnings = (message.warnings || []).join(' ');
@@ -3150,6 +4068,7 @@ orca.onMessage(message => {
       row.new_price = String(fetched.price);
       row.price_touched = true;
       row.price_pending = false;
+      row.price_key = fmPriceStageKey(row);
       row.price_error = '';
       renderRows();
     }
@@ -3189,7 +4108,9 @@ orca.onMessage(message => {
       const row = rowBySlot(item.slot);
       if (!row) return;
       row.apply_error = item.error || 'Could not apply';
-      row.dirty = true;
+      row.pending = false;
+      row.price_pending = false;
+      fmApplyErrorState(row);
     });
     renderRows();
     const failed = (message.apply_errors || []).length;
@@ -3198,12 +4119,25 @@ orca.onMessage(message => {
            failed ? 'err' : (warnings ? 'warn' : 'ok'));
     if (message.refresh_presets) post('refresh');
   }
+  if (message.muted) {
+    const muted = new Set(message.muted || []);
+    state.rows.forEach(row => { row.ignored = muted.has(row.identity); });
+    renderRows();
+    status(message.message || (message.muted ? 'Muted.' : 'Unmuted.'), 'ok');
+  }
   if (message.detail) {
     if (!$('presetModal').hidden && Number(message.detail.slot) === detailSlot) {
       const detail = message.detail.preset || {};
       $('presetTitle').textContent = detail.select_name || detail.name || 'Preset';
       $('presetBody').innerHTML = configTable(detail.config || []);
     }
+  }
+  if (message.message && !message.error && !message.price_error &&
+      !message.scan && !message.match && !message.applied && !message.applied_all &&
+      !message.settings && !message.price_fetched && !message.detail &&
+      !message.cache_cleared && !message.muted) {
+    // "already open", "Preset list refreshed", and other bare host messages.
+    status(message.message, 'info');
   }
 });
 orca.postMessage({command: 'init'});
@@ -3262,14 +4196,17 @@ if orca is not None:
                 "ofd_library": None,
                 "ofd_key": None,
             }
+            window = None
             try:
                 if self._cancelled:
                     return orca.ExecutionResult.success("Closed.")
                 # Script execute() runs on a dedicated background Script worker
                 # in Orca 2.5.x; the dock panel is created on the UI thread and
                 # returns immediately. The loop below handles work the page
-                # asks for.
-                self.window = self._open_ui()
+                # asks for. Capture this run's window/queue locally so a second
+                # Run cannot make the old loop post to or clear the new one.
+                window = self._open_ui()
+                self.window = window
                 while True:
                     message = commands.get()
                     if self._cancelled or message.get("command") == "close":
@@ -3277,14 +4214,14 @@ if orca is not None:
                     try:
                         reply = self._run(message)
                     except Exception as error:
-                        print("[Filament Match] %s" % _error_text(error), file=sys.stderr)
+                        _log_error("[Filament Match] %s" % _error_text(error))
                         reply = {
                             "rid": message.get("rid"),
                             "slot": message.get("slot"),
                             "error": _error_text(error),
                         }
-                    if self.window is not None and self.window.is_open():
-                        self.window.post(reply)
+                    if window is not None and window.is_open():
+                        window.post(reply)
             except Exception as error:
                 return orca.ExecutionResult.failure(
                     orca.PluginResult.RecoverableError,
@@ -3292,7 +4229,8 @@ if orca is not None:
             finally:
                 if self._commands is commands:
                     self._commands = None
-                self.window = None
+                if self.window is window:
+                    self.window = None
 
         def _open_ui(self):
             """A docked panel beside the sidebar; a window on older hosts."""
@@ -3305,8 +4243,8 @@ if orca is not None:
                         on_message=self._on_message, on_close=self._on_close,
                         dock="right")
                 except Exception as error:
-                    print("[Filament Match] dock panel unavailable: %s"
-                          % _error_text(error), file=sys.stderr)
+                    _log_error("[Filament Match] dock panel unavailable: %s"
+                               % _error_text(error))
             return ui.create_window(
                 PAGE, title="Filament Match", width=1000, height=760,
                 on_message=self._on_message, on_close=self._on_close)
@@ -3337,8 +4275,21 @@ if orca is not None:
                 present = sum(
                     1 for row in rows
                     if (row.get("observation") or {}).get("present") is not False)
-                mismatch = _slot_mismatch(
-                    len(rows), len(snapshot.get("slots") or []))
+                feeders, feeders_known = _feed_count([
+                    _observation_from_form(row.get("slot") or 0,
+                                           row.get("observation") or {})
+                    for row in rows])
+                slots = len(snapshot.get("slots") or [])
+                # Only report a mismatch when the printer total is known; a
+                # loaded-lanes-only source must not produce a false count.
+                mismatch = _slot_mismatch(feeders, slots) if feeders_known \
+                    else _slot_mismatch(0, 0)
+                if not feeders_known:
+                    mismatch.update({
+                        "feeders": feeders,
+                        "slots": slots,
+                        "feeders_known": False,
+                    })
                 message_text = (
                     "Matched %d feed(s)." % present if present
                     else "No filament feeds detected.")
@@ -3348,6 +4299,8 @@ if orca is not None:
                     "rid": rid,
                     "scan": rows,
                     "slot_mismatch": mismatch,
+                    "feeders": feeders,
+                    "feeders_known": feeders_known,
                     "spoolman": session.get("spoolman_status") or {
                         "available": False,
                         "message": "Add a Spoolman URL in Settings to fetch prices.",
@@ -3383,6 +4336,12 @@ if orca is not None:
                 }
 
             if command == "match":
+                if isinstance(session, dict):
+                    # Edited fields are a new query; clear the per-scan OFD
+                    # and failure caches so Match really re-runs the lookup.
+                    session["ofd_result_cache"] = {}
+                    session.pop("ofd_scan_failure", None)
+                    session.pop("ofd_scan_warned", None)
                 history = _history_store(storage, warnings)
                 observation_values = message.get("observation") or {}
                 observation = _observation_from_form(
@@ -3424,6 +4383,7 @@ if orca is not None:
                 errors = []
                 skipped = []
                 refresh_presets = False
+                created_copies = {}
                 for entry in entries:
                     if not isinstance(entry, dict):
                         continue
@@ -3442,7 +4402,8 @@ if orca is not None:
                         continue
                     try:
                         reply = _apply_selection(
-                            entry, snapshot, settings, storage, session, warnings)
+                            entry, snapshot, settings, storage, session, warnings,
+                            created=created_copies)
                     except Exception as error:
                         errors.append({"slot": slot, "error": _error_text(error)})
                         _warn(warnings, "T%s: %s" % (slot, _error_text(error)))
@@ -3458,7 +4419,15 @@ if orca is not None:
                     feeders = 0
                 if feeders < 1:
                     feeders = max(len(entries), slots + len(skipped))
-                mismatch = _slot_mismatch(feeders, slots)
+                feeders_known = message.get("feeders_known", True) is not False
+                mismatch = _slot_mismatch(feeders, slots) if feeders_known \
+                    else _slot_mismatch(0, 0)
+                if not feeders_known:
+                    mismatch.update({
+                        "feeders": feeders,
+                        "slots": slots,
+                        "feeders_known": False,
+                    })
                 if skipped:
                     missing = len(skipped)
                     if applied_rows:
@@ -3631,7 +4600,7 @@ if orca is not None:
 
                 raise ValueError("Unknown command: %s" % command)
             except Exception as error:
-                print("[Filament Match] %s" % _error_text(error), file=sys.stderr)
+                _log_error("[Filament Match] %s" % _error_text(error))
                 if self.window is not None and self.window.is_open():
                     self.window.post({
                         "rid": rid,
