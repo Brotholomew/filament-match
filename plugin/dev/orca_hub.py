@@ -198,7 +198,7 @@ def command_login(args):
             self.end_headers()
             if "code" in result:
                 self.wfile.write(
-                    b"<h2>Filament Match is connected.</h2>"
+                    b"<h2>Orca Cloud sign-in received.</h2>"
                     b"<p>You can close this tab and return to the terminal.</p>")
             else:
                 self.wfile.write(
