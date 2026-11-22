@@ -19,9 +19,9 @@ DIST = HERE / "dist" / "filament_match.py"
 OUT = HERE / "hub" / "filament_match_any.py"
 
 DESCRIPTION = (
-    "Matches the filament loaded in each printer slot to an OrcaSlicer "
-    "filament preset, with optional Spoolman and Open Filament Database "
-    "enrichment, reviewable matches, price sync and confirmed history."
+    "Matches the filament loaded in each printer slot to your installed "
+    "OrcaSlicer presets or a ready-to-use Open Filament Database profile, "
+    "with optional Spoolman enrichment and per-kg price sync."
 )
 AUTHOR = "brotholomew"
 NEW_DOCSTRING = '''"""Filament Match.

@@ -948,3 +948,12 @@ Two additional failures surfaced with the CC3D custom preset:
    explicit precedence in exact and fuzzy sorting, so it ranks before the
    original user/system preset. With multiple exact candidates, `choose=True`
    and Match opens the chooser.
+
+### 10.12 Open Filament Database enabled by default (0.8.1)
+
+`_default_settings()` and `_normalize_settings()` now default `ofd_enabled` to
+`True`. A missing or null setting enables OFD; an explicit stored `False` still
+disables it. The Settings checkbox is checked on first run, and the UI marks it
+as recommended. The OFD index and preset cache are unchanged, so an existing
+cache is reused immediately. The default is covered by
+`test_open_filament_database_is_enabled_by_default`.

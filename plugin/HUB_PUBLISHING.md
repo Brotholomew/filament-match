@@ -24,25 +24,23 @@ In Orca Cloud → **Plugins → Shared → +**, use:
 | Type | **Script** |
 | Plugin files | `plugin/hub/filament_match_any.py` |
 | Name | `Filament Match` |
-| Version | `0.8.0` |
+| Version | `0.8.1` |
 | Min. OrcaSlicer version | `2.5.2` |
 | Tags | `filament, spoolman, printer, ams, utility` |
 | Public plugin | your choice |
 
-Suggested first GitHub release changelog:
+Suggested 0.8.1 changelog:
 
 ```text
-Filament Match 0.8.0
+Filament Match 0.8.1
 
-Scans printer filament feeds and matches them to compatible OrcaSlicer presets.
-Includes review/Match/Apply, optional Spoolman enrichment and per-kg price
-sync, Open Filament Database library candidates, slot-count mismatch handling,
-and confirmed spool/tag/filament history.
+Open Filament Database matching is now enabled by default. Filament Match can
+find a ready-to-use preset for a new filament from the Open Filament Database
+without manual preset creation, alongside the presets already installed in Orca.
+Spoolman users can still sync per-kg prices with their chosen instance.
 
-Fixes:
-- strip (local), (custom), (OFD) and (copy) labels when matching;
-- flatten user presets when creating local price copies so Orca can load them;
-- remove the legacy orca_plugins/filament_match.py folder on install.
+The plugin description now explains the OFD-first matching flow and the
+optional Spoolman price sync.
 ```
 
 The metadata in the generated file is:
@@ -51,7 +49,7 @@ The metadata in the generated file is:
 # [tool.orcaslicer.plugin]
 # id = "filament-match"
 # name = "Filament Match"
-# version = "0.8.0"
+# version = "0.8.1"
 # author = "brotholomew"
 ```
 
@@ -94,8 +92,8 @@ python3 plugin/build_hub_file.py --version "${GITHUB_REF_NAME#v}"
 ```
 
 The GitHub release tag must be a higher semantic version than the published
-plugin version. `v0.8.0` was the first successful repository release; later
-releases could be `v0.8.1` or `v0.9.0`. The `--version` override updates both the file header
+plugin version. `v0.8.0` was the first successful repository release; `v0.8.1`
+enables OFD by default, and later releases could be `v0.8.2` or `v0.9.0`. The `--version` override updates both the file header
 and `PLUGIN_VERSION` so the uploaded code matches the release tag.
 
 ## Local development build

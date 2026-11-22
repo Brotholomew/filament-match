@@ -5,17 +5,17 @@
 # [tool.orcaslicer.plugin]
 # id = "filament-match"
 # name = "Filament Match"
-# description = "Matches the filament loaded in each printer slot to an OrcaSlicer filament preset, shows why it matched, and remembers confirmed spool, tag and filament mappings."
+# description = "Matches the filament loaded in each printer slot to your installed OrcaSlicer presets or a ready-to-use Open Filament Database profile, with optional Spoolman enrichment and per-kg price sync."
 # author = "Filament Match contributors"
-# version = "0.8.0"
+# version = "0.8.1"
 # ///
 """Filament Match.
 
 Run from the Plugins dialog or Speed Dial. The plugin opens a docked panel,
 reads the filaments reported by the active Moonraker or Snapmaker printer,
-optionally resolves spool IDs through Spoolman and product names through the
-Open Filament Database, and matches every slot to a compatible installed Orca
-filament preset.
+resolves product names through the Open Filament Database and optionally spool
+IDs through Spoolman, and matches every slot to a compatible preset from the
+installed Orca library or the Open Filament Database.
 
 Scanning runs automatically when the panel opens. It only selects the best
 candidate in each row; nothing is written to Orca until the user presses the
@@ -59,7 +59,7 @@ except ImportError:  # syntax checks and unit tests outside OrcaSlicer
 # to sys.path for imports of sibling modules.
 sys.path.insert(0, os.path.dirname(__file__))
 
-PLUGIN_VERSION = "0.8.0"
+PLUGIN_VERSION = "0.8.1"
 BUNDLE_ID = "filament_match"
 BUNDLE_NAME = "Filament Match Library"
 DEFAULT_OFD_INDEX = "https://api.openfilamentdatabase.org/orcaslicer/index.json"
@@ -461,7 +461,7 @@ def _history_path(storage):
 def _default_settings():
     return {
         "spoolman_url": "",
-        "ofd_enabled": False,
+        "ofd_enabled": True,
         "ofd_index_url": DEFAULT_OFD_INDEX,
         "ignored": [],
     }
@@ -475,7 +475,9 @@ def _normalize_settings(raw):
         if key == "ofd_index_url" and not value:
             value = DEFAULT_OFD_INDEX
         defaults[key] = value.rstrip("/") if value else ""
-    flag = raw.get("ofd_enabled", False)
+    flag = raw.get("ofd_enabled", True)
+    if flag is None:
+        flag = True
     if isinstance(flag, str):
         flag = flag.strip().lower() in ("1", "true", "yes", "on")
     defaults["ofd_enabled"] = bool(flag)
@@ -2434,7 +2436,8 @@ details.settings > summary { cursor: pointer; padding: 8px 0; color: var(--muted
     <label>Spoolman URL <span class="dim">(optional)</span>
       <input type="text" id="spoolman" placeholder="http://spoolman.local:7912" autocomplete="off">
     </label>
-    <label class="inline"><input type="checkbox" id="ofd"> Open Filament Database</label>
+    <label class="inline"><input type="checkbox" id="ofd"> Open Filament Database <span class="dim">(recommended)</span></label>
+    <div class="dim">On by default: find presets for filaments you have not installed. Disable to match only installed Orca presets.</div>
     <label id="ofdIndexWrap">OFD index URL
       <input type="text" id="ofdindex" autocomplete="off">
     </label>

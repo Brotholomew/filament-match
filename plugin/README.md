@@ -1,13 +1,13 @@
 # Filament Match
 
-An OrcaSlicer 2.5+ plugin that reads the filaments loaded in a printer, proposes
-the best Orca filament preset for each slot, lets you review/edit the detected
-fields and the match, and remembers confirmed spool/tag/filament → preset
-mappings.
+An OrcaSlicer 2.5+ plugin that reads the filaments loaded in a printer, finds
+the best matching preset for each slot from your installed Orca presets and the
+[Open Filament Database](https://openfilamentdatabase.org/), lets you
+review/edit the detected fields and the match, and remembers confirmed
+spool/tag/filament → preset mappings.
 
-It is a **matcher and review layer**, not a preset generator and not a Spoolman
-requirement. It works with the presets already installed in Orca; Spoolman and
-the Open Filament Database are optional.
+OFD matching is enabled by default, so a new filament does not need a hand-built
+preset. Spoolman is optional enrichment and price sync, not a requirement.
 
 ## Install
 
@@ -79,7 +79,7 @@ printer itself and leaves Orca's native button untouched.
    Vendor presets that carry the variant only in their name (for example
    `Snapmaker PLA SnapSpeed`) are compared by the name tokens when the preset
    has no explicit subtype setting.
-5. An optional Open Filament Database candidate. The index is cached locally;
+5. An Open Filament Database candidate (enabled by default). The index is cached locally;
    matching uses it without a network request, so vendor presets still appear
    when Orca's network permission is denied. Applying a candidate uses a cached
    preset JSON when available and fetches one preset otherwise.
@@ -152,7 +152,9 @@ filament matching.
 
 ## OFD cache
 
-The **Settings** tile has **Clear OFD cache**. It deletes only the local OFD
+OFD matching is enabled by default. To match only installed Orca presets, clear
+**Open Filament Database** in Settings. The **Settings** tile has **Clear OFD
+cache**. It deletes only the local OFD
 index (`ofd_index.json`) and cached preset JSON (`ofd_presets/`); history,
 settings and installed presets are kept. The next **↻** downloads a fresh index
 and whichever preset is needed.

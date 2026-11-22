@@ -67,7 +67,24 @@ class EntrySmokeTests(unittest.TestCase):
         self.assertTrue(text.startswith("# /// script"))
         self.assertIn('[tool.orcaslicer.plugin]', text)
         self.assertIn('name = "Filament Match"', text)
-        self.assertIn('version = "0.8.0"', text)
+        self.assertIn('version = "0.8.1"', text)
+
+    def test_open_filament_database_is_enabled_by_default(self):
+        fake = _fake_orca()
+        sys.modules["orca"] = fake
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "filament_match_defaults", ENTRY)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            self.assertTrue(module._default_settings()["ofd_enabled"])
+            self.assertTrue(module._normalize_settings({})["ofd_enabled"])
+            self.assertTrue(module._normalize_settings(
+                {"ofd_enabled": None})["ofd_enabled"])
+            self.assertFalse(module._normalize_settings(
+                {"ofd_enabled": False})["ofd_enabled"])
+        finally:
+            sys.modules.pop("orca", None)
 
     def test_entry_imports_and_registers(self):
         fake = _fake_orca()

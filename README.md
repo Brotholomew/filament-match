@@ -1,13 +1,18 @@
 # Filament Match
 
-Filament Match is an OrcaSlicer plugin that reads the filament loaded in each
-printer slot, finds the best matching Orca filament preset, lets you review and
-change the match, and applies the result to your project. Spoolman and the Open
-Filament Database are optional enrichments, not requirements.
+**Stop hand-building filament presets.**
 
-It is a **matcher and review layer**, not a preset generator. It works with the
-presets already installed in Orca and remembers the spool, tag and filament
-mappings you confirm.
+When you use Filament Match, you don't have to manually create a preset for
+every spool or limit yourself to the Orca presets you already have. It reads the
+filament data exposed by your printer and finds the best matching preset using
+the **[Open Filament Database](https://openfilamentdatabase.org/)** — an open
+catalogue of community-maintained filament profiles — alongside your installed
+Orca presets. OFD matching is **enabled by default**. If you use Spoolman, it can
+also sync your price information with your chosen Spoolman instance.
+
+Filament Match is the review layer between your printer and Orca: scan, inspect
+the match, edit the metadata if needed, and press **Apply**. It remembers the
+spool, tag and filament mappings you confirm.
 
 ![Filament Match applies matched presets to the printer slots](assets/8-apply-the-chosen-presets.jpg)
 
@@ -16,8 +21,10 @@ mappings you confirm.
 - Reads filament data directly from the connected Moonraker or Snapmaker
   printer. There is no printer IP field to configure; the address comes from
   Orca.
-- Matches every feed to a compatible installed Orca filament preset and shows
-  why it matched.
+- Matches every feed to a compatible preset from your installed Orca library
+  **and** the Open Filament Database, and shows why it matched.
+- OFD matching is on by default, so a new spool does not need a hand-built
+  preset before you can use it.
 - Scans automatically when the panel opens, but only **selects** candidates.
   Nothing is written to Orca until you press **Apply**.
 - Lets you edit the detected vendor, material, subtype, product and colour,
@@ -27,13 +34,26 @@ mappings you confirm.
   product, material, colour, temperatures and subtype.
 - Fetches per-kg filament prices from Spoolman and writes them back to Orca
   presets. Manual price entry works without Spoolman.
-- Uses the Open Filament Database (OFD) to propose presets for filaments that
-  are not installed, with a local index cache for offline matching.
+- Proposes and installs Open Filament Database presets for filaments that are
+  not installed, with a local index cache for offline matching.
 - Handles printer/project slot-count mismatches without silently changing the
   project or producing an error per extra feed.
 - Remembers confirmed spool/tag/filament mappings across restarts and plugin
   reinstalls.
 - Pure Python, no third-party packages, works on macOS, Windows and Linux.
+
+## No local preset? No problem.
+
+The [Open Filament Database](https://openfilamentdatabase.org/) is an open
+catalogue of filament profiles. Filament Match uses it as a second preset
+library automatically: scan the printer, and if no installed preset is a strong
+match, the plugin proposes the best OFD profile and can install it into Orca in
+one **Apply**. You are not limited to the handful of presets already on your
+machine, and you do not have to create a preset by hand just to use a new
+filament.
+
+OFD matching is enabled by default. You can turn it off or point the plugin at a
+different index in the **Settings** tile.
 
 ## How to install
 
@@ -228,13 +248,20 @@ is not needed for the plugin to work.
 
 ## Open Filament Database
 
-If no installed preset is a good match, the plugin can propose an OFD preset.
+**OFD matching is enabled by default.** The
+[Open Filament Database](https://openfilamentdatabase.org/) is an open catalogue
+of community-maintained filament profiles. If no installed preset is a good
+match, the plugin proposes the best OFD profile, shows its brand and product
+metadata, and installs it into Orca when you press **Apply**. You do not need to
+create the preset manually or leave Orca to find it.
+
 The OFD index is cached locally and used without a network request, so vendor
 presets still appear when Orca's network permission is denied. Applying an OFD
 candidate uses a cached preset JSON when available and fetches one preset
-otherwise.
+otherwise. To match only installed Orca presets, clear **Open Filament Database**
+in the **Settings** tile.
 
-The **Settings** tile has **Clear OFD cache**. It deletes only the local OFD
+The **Settings** tile also has **Clear OFD cache**. It deletes only the local OFD
 index (`ofd_index.json`) and cached preset JSON (`ofd_presets/`); history,
 settings and installed presets are kept. The next **↻** downloads a fresh index.
 
@@ -251,7 +278,7 @@ settings and installed presets are kept. The next **↻** downloads a fresh inde
 4. A fuzzy name/colour match above a confidence threshold. Vendor presets that
    carry the variant only in their name (for example `Snapmaker PLA SnapSpeed`)
    are compared by name tokens when the preset has no explicit subtype setting.
-5. An optional Open Filament Database candidate.
+5. An Open Filament Database candidate (enabled by default).
 6. The exact compatible `Generic <material>` preset, not a variant such as
    `Generic PLA-CF`, unless no exact generic material preset exists.
 
@@ -359,7 +386,7 @@ Build the Orca Cloud artifact:
 ```sh
 python3 plugin/build_hub_file.py
 # or, for a release version:
-python3 plugin/build_hub_file.py --version 0.8.0
+python3 plugin/build_hub_file.py --version 0.8.1
 ```
 
 The Hub artifact is written to `plugin/hub/filament_match_any.py`. The `_any`
