@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import http.server
+import inspect
 import json
 import ntpath
 import os
@@ -155,6 +156,21 @@ class ValueHelperTests(unittest.TestCase):
         self.assertIsNone(sources.safe_int(float("nan")))
         self.assertIsNone(sources.safe_int(float("inf")))
         self.assertIsNone(sources.safe_int([1]))
+
+    def test_at_mapping_is_consistently_zero_or_one_based(self):
+        one_based = {"1": "A", "2": "B"}
+        self.assertEqual(sources._at(one_based, 0), "A")
+        self.assertEqual(sources._at(one_based, 1), "B")
+        self.assertIsNone(sources._at(one_based, 2))
+
+        zero_based = {"0": "A", "1": "B"}
+        self.assertEqual(sources._at(zero_based, 0), "A")
+        self.assertEqual(sources._at(zero_based, 1), "B")
+        self.assertIsNone(sources._at(zero_based, 2))
+
+        named = {"T1": "A", "T2": "B"}
+        self.assertEqual(sources._at(named, 0), "A")
+        self.assertEqual(sources._at(named, 1), "B")
 
     def test_normalize_color_hex_forms(self):
         cases = {
@@ -632,6 +648,41 @@ class MergeAndReadPrinterTests(unittest.TestCase):
             observations, errors = sources.read_printer("http://printer.local")
         self.assertEqual(observations, [])
         self.assertEqual(errors, ["no filament slots reported by Snapmaker or Moonraker"])
+
+    def test_read_printer_public_signature_matches_entry_calls(self):
+        parameters = inspect.signature(sources.read_printer).parameters
+        self.assertEqual(
+            list(parameters),
+            ["base_url", "api_key", "timeout", "port", "agent"],
+        )
+
+        calls = []
+
+        def fake(url, timeout=None, headers=None):
+            calls.append(url)
+            return load_bytes("snapmaker_response.json")
+
+        with mock.patch.object(sources, "_open_url", fake):
+            # The entry worker calls reader(url, api_key, timeout=...).
+            observations, errors = sources.read_printer(
+                "printer.local", "secret", timeout=3.0
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(len(observations), 4)
+            # The optional agent/port keywords must not raise a TypeError.
+            observations, errors = sources.read_printer(
+                "printer.local",
+                "secret",
+                timeout=3.0,
+                port=7126,
+                agent="snapmaker",
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(len(observations), 4)
+        self.assertTrue(calls[0].startswith("http://printer.local/"))
+        self.assertTrue(
+            any(url.startswith("http://printer.local:7126/") for url in calls)
+        )
 
     def test_read_printer_without_url(self):
         observations, errors = sources.read_printer("")
@@ -1159,8 +1210,24 @@ class UrlAndSpoolmanNormalizationTests(unittest.TestCase):
     def test_normalize_base_url_ipv6_and_configured_port(self):
         self.assertEqual(sources.normalize_base_url("fd00::1"), "http://[fd00::1]")
         self.assertEqual(
+            sources.normalize_base_url("[fd00::1]"),
+            "http://[fd00::1]",
+        )
+        self.assertEqual(
             sources.normalize_base_url("[fd00::1]:7912"),
             "http://[fd00::1]:7912",
+        )
+        self.assertEqual(
+            sources.normalize_base_url("fd00::1:7125"),
+            "http://[fd00::1]:7125",
+        )
+        self.assertEqual(
+            sources.normalize_base_url("2001:db8::1"),
+            "http://[2001:db8::1]",
+        )
+        self.assertEqual(
+            sources.normalize_base_url("2001:db8:0:0:0:0:0:1"),
+            "http://[2001:db8:0:0:0:0:0:1]",
         )
         self.assertEqual(
             sources.normalize_base_url("http://fd00::1"),

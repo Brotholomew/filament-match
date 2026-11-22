@@ -164,6 +164,38 @@ def safe_int(value: Any, default: int | None = None) -> int | None:
     return default
 
 
+def _split_ipv6_port(text: str) -> tuple[str, str]:
+    """Split an unbracketed ``IPv6:port`` authority.
+
+    IPv6 itself contains colons, so a trailing all-digit group is ambiguous.
+    Treat it as a port only when the part before it is a valid IPv6 literal and
+    the digit group is a plausible multi-digit port; this keeps bare addresses
+    such as ``fd00::1`` intact while accepting ``fd00::1:7125``.
+    """
+
+    host = safe_str(text)
+    if host.count(":") < 2:
+        return host, ""
+    prefix, separator, port = host.rpartition(":")
+    if not separator or not re.fullmatch(r"\d{2,5}", port):
+        return host, ""
+    try:
+        port_number = int(port)
+    except ValueError:
+        return host, ""
+    if not 1 <= port_number <= 65535:
+        return host, ""
+    try:
+        ipaddress.IPv6Address(prefix)
+    except ValueError:
+        return host, ""
+    if "::" not in host and host.count(":") != 8:
+        # A full IPv6 literal has seven colons; eight means the last group is
+        # the separate port after a full eight-group address.
+        return host, ""
+    return prefix, port
+
+
 def _bracket_authority(authority: str) -> str:
     """Bracket an unbracketed IPv6 literal in a URL authority."""
 
@@ -175,6 +207,9 @@ def _bracket_authority(authority: str) -> str:
         prefix, text = text.rsplit("@", 1)
         userinfo = prefix + "@"
     if text.count(":") >= 2:
+        host, port = _split_ipv6_port(text)
+        if port:
+            return userinfo + "[" + host + "]:" + port
         return userinfo + "[" + text + "]"
     return userinfo + text
 
@@ -563,10 +598,24 @@ def _collection_len(value: Any) -> int:
 
 
 def _at(value: Any, index: int) -> Any:
-    """Read slot ``index`` (zero based) from a list, mapping, or scalar."""
+    """Read slot ``index`` (zero based) from a list, mapping, or scalar.
+
+    Mapping-shaped printer responses are interpreted consistently: a mapping
+    with a ``0`` (or ``"0"``) key is zero-based; otherwise its numeric keys are
+    one-based.  Trying both would make ``{"1": "A", "2": "B"}`` return the
+    first slot for index 1.  ``T<n>``/``lane<n>`` keys remain supported as the
+    one-based names used by printer payloads.
+    """
 
     if isinstance(value, Mapping):
-        for key in (index, str(index), index + 1, str(index + 1), f"T{index + 1}", f"lane{index + 1}"):
+        zero_based = 0 in value or "0" in value
+        offset = 0 if zero_based else 1
+        for key in (
+            index + offset,
+            str(index + offset),
+            f"T{index + 1}",
+            f"lane{index + 1}",
+        ):
             if key in value:
                 return value[key]
         return None
