@@ -69,6 +69,7 @@ __all__ = [
     "normalize_text",
     "normalize_vendor",
     "normalize_material",
+    "material_family",
     "normalize_color",
     "normalize_tag_uid",
     "strip_printer_suffix",
@@ -312,6 +313,65 @@ def normalize_material(value: Any) -> str:
     matching, generic lookup and identity.
     """
     return _canonical_material_words(normalize_text(value))
+
+
+def material_family(value: Any) -> str:
+    """The base material family: ``pla cf`` → ``pla``, ``tpu 95a`` → ``tpu``."""
+    material = normalize_material(value)
+    return material.split(" ", 1)[0] if material else ""
+
+
+def _is_material_variant_token(token: str) -> bool:
+    """CF/GF and hardness tokens that must be confirmed by evidence."""
+    return token in {"cf", "gf"} or bool(
+        re.fullmatch(r"\d{2,3}[ad]", token)
+    )
+
+
+def _material_variant_tokens_from_text(value: Any) -> set[str]:
+    return {
+        token for token in normalize_text(value).split()
+        if _is_material_variant_token(token)
+    }
+
+
+def _material_variant_tokens_from_material(value: Any) -> set[str]:
+    parts = normalize_material(value).split()
+    return {
+        token for token in parts[1:]
+        if _is_material_variant_token(token)
+    }
+
+
+def _observation_variant_tokens(obs: Observation) -> set[str]:
+    tokens = _material_variant_tokens_from_material(
+        getattr(obs, "material", "")
+    )
+    tokens.update(_material_variant_tokens_from_text(
+        getattr(obs, "subtype", "")
+    ))
+    tokens.update(_material_variant_tokens_from_text(
+        getattr(obs, "product", "")
+    ))
+    return tokens
+
+
+def _preset_variant_tokens(preset: Any) -> set[str]:
+    tokens = _material_variant_tokens_from_material(
+        getattr(preset, "material", "")
+    )
+    tokens.update(_material_variant_tokens_from_text(
+        getattr(preset, "subtype", "")
+    ))
+    tokens.update(_material_variant_tokens_from_text(
+        _name_without_vendor_material(preset)
+    ))
+    return tokens
+
+
+def _material_variants_match(obs: Observation, preset: Any) -> bool:
+    """CF/GF/hardness evidence must agree in both directions."""
+    return _observation_variant_tokens(obs) == _preset_variant_tokens(preset)
 
 
 def _parse_hex_color(value: Any) -> tuple[int, int, int] | None:
@@ -667,6 +727,12 @@ def _subtype_match(obs: Observation, preset: Any) -> tuple[int, str]:
     if not observed:
         return 0, ""
     configured = normalize_text(getattr(preset, "subtype", ""))
+    if not configured:
+        # Sources normally split base material and subtype, but some presets
+        # store the variant in the material field ("PLA-CF", "TPU-95A").
+        configured = " ".join(
+            normalize_material(getattr(preset, "material", "")).split()[1:]
+        )
     if configured and observed == configured:
         return 2, f"subtype {_core_text(getattr(obs, 'subtype', '')).strip()}"
 
@@ -694,12 +760,13 @@ def score_preset(obs: Observation, preset: PresetInfo) -> tuple[int, list[str]]:
     score = 0
     reasons: list[str] = []
 
-    observed_material = normalize_material(getattr(obs, "material", ""))
-    preset_material = normalize_material(getattr(preset, "material", ""))
-    if observed_material and preset_material and observed_material != preset_material:
-        # Material mismatch is a veto, not a reduced score.
+    observed_family = material_family(getattr(obs, "material", ""))
+    preset_family = material_family(getattr(preset, "material", ""))
+    if observed_family and preset_family and observed_family != preset_family:
+        # Material family mismatch is a veto, not a reduced score. Variants
+        # such as CF/GF/hardness are constrained by subtype/name checks.
         return 0, []
-    if observed_material and observed_material == preset_material:
+    if observed_family and observed_family == preset_family:
         score += 30
         reasons.append(f"material {_core_text(getattr(obs, 'material', '')).strip()}")
 
@@ -1196,13 +1263,15 @@ def _vendor_matches(obs: Observation, preset: Any) -> bool:
 
 
 def _material_matches(obs: Observation, preset: Any) -> bool:
-    observed = normalize_material(getattr(obs, "material", ""))
-    if not observed:
+    observed_family = material_family(getattr(obs, "material", ""))
+    if not observed_family:
         return True
-    preset_material = normalize_material(getattr(preset, "material", ""))
-    if not preset_material:
+    preset_family = material_family(getattr(preset, "material", ""))
+    if not preset_family:
         return True
-    return observed == preset_material
+    if observed_family != preset_family:
+        return False
+    return _material_variants_match(obs, preset)
 
 
 def _colour_veto(obs: Observation, preset: Any) -> bool:
@@ -1328,12 +1397,14 @@ def _metadata_reasons(obs: Observation) -> list[str]:
 
 def _exact_metadata(obs: Observation, preset: PresetInfo) -> bool:
     observed_vendor = _vendor_token(getattr(obs, "vendor", ""))
-    observed_material = normalize_material(getattr(obs, "material", ""))
-    if not observed_vendor or not observed_material:
+    observed_family = material_family(getattr(obs, "material", ""))
+    if not observed_vendor or not observed_family:
         return False
     if not _vendor_matches(obs, preset):
         return False
-    if observed_material != normalize_material(getattr(preset, "material", "")):
+    if observed_family != material_family(getattr(preset, "material", "")):
+        return False
+    if not _material_variants_match(obs, preset):
         return False
     observed_subtype = normalize_text(getattr(obs, "subtype", ""))
     if observed_subtype:
@@ -1355,9 +1426,15 @@ def _history_matches_observation(obs: Observation, preset: PresetInfo) -> bool:
     """
     if not _vendor_matches(obs, preset):
         return False
-    observed_material = normalize_material(getattr(obs, "material", ""))
-    if observed_material and observed_material != normalize_material(getattr(preset, "material", "")):
-        return False
+    observed_family = material_family(getattr(obs, "material", ""))
+    preset_family = material_family(getattr(preset, "material", ""))
+    if observed_family:
+        if observed_family != preset_family:
+            return False
+        # Without a reported material the confirmed history is still trusted;
+        # with one, CF/GF/hardness must agree.
+        if not _material_variants_match(obs, preset):
+            return False
     observed_subtype = normalize_text(getattr(obs, "subtype", ""))
     if observed_subtype:
         subtype_level, _reason = _subtype_match(obs, preset)
@@ -1575,11 +1652,14 @@ def _filament_id_compatible(obs: Observation, preset: PresetInfo) -> bool:
     """An ID match still has to agree with the observed metadata."""
     if not _vendor_matches(obs, preset):
         return False
-    observed_material = normalize_material(getattr(obs, "material", ""))
-    if observed_material:
-        preset_material = normalize_material(getattr(preset, "material", ""))
-        if preset_material and observed_material != preset_material:
-            return False
+    observed_family = material_family(getattr(obs, "material", ""))
+    if observed_family:
+        preset_family = material_family(getattr(preset, "material", ""))
+        if preset_family:
+            if observed_family != preset_family:
+                return False
+            if not _material_variants_match(obs, preset):
+                return False
     if _colour_veto(obs, preset):
         return False
     return True

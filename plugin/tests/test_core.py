@@ -1187,6 +1187,96 @@ class MaterialAliasTests(unittest.TestCase):
         self.assertEqual(core.normalize_material("TPU 95A"), "tpu 95a")
 
 
+class MaterialFamilyTests(unittest.TestCase):
+    def test_material_family_returns_the_first_canonical_token(self):
+        self.assertEqual(core.material_family("PLA-CF"), "pla")
+        self.assertEqual(core.material_family("TPU-95A"), "tpu")
+        self.assertEqual(core.material_family("PA-CF"), "pa")
+        self.assertEqual(core.material_family("PLA+"), "pla")
+        self.assertEqual(core.material_family(""), "")
+
+    def test_observation_material_variant_matches_base_preset_subtype(self):
+        preset = make_preset("eSUN PLA-CF @System", vendor="eSUN",
+                             material="PLA", subtype="CF")
+        obs = make_obs(vendor="eSUN", material="PLA-CF", product="Pink",
+                       color="#ff0000")
+        result = core.match_observation(obs, [preset])
+        self.assertEqual(result.source, "installed")
+        self.assertEqual(result.preset_name, preset.name)
+        self.assertEqual(result.confidence, 95)
+
+    def test_preset_material_variant_matches_observation_subtype(self):
+        preset = make_preset("eSUN PLA-CF @System", vendor="eSUN",
+                             material="PLA-CF")
+        obs = make_obs(vendor="eSUN", material="PLA", subtype="CF",
+                       product="Pink", color="#ff0000")
+        self.assertEqual(core._subtype_match(obs, preset)[0], 2)
+        result = core.match_observation(obs, [preset])
+        self.assertEqual(result.source, "installed")
+        self.assertEqual(result.preset_name, preset.name)
+        self.assertEqual(result.confidence, 95)
+
+    def test_tpu_hardness_in_material_field_matches_split_subtype(self):
+        preset = make_preset("eSUN TPU-95A @System", vendor="eSUN",
+                             material="TPU-95A")
+        obs = make_obs(vendor="eSUN", material="TPU", subtype="95A")
+        result = core.match_observation(obs, [preset])
+        self.assertEqual(result.preset_name, preset.name)
+
+        reverse_preset = make_preset("eSUN TPU-95A @System", vendor="eSUN",
+                                     material="TPU", subtype="95A")
+        reverse_obs = make_obs(vendor="eSUN", material="TPU-95A")
+        result = core.match_observation(reverse_obs, [reverse_preset])
+        self.assertEqual(result.preset_name, reverse_preset.name)
+
+    def test_plain_pla_does_not_auto_select_a_cf_only_preset(self):
+        variants = [
+            make_preset("eSUN PLA-CF material", vendor="eSUN",
+                        material="PLA-CF", subtype="CF"),
+            make_preset("eSUN PLA-CF subtype", vendor="eSUN",
+                        material="PLA", subtype="CF"),
+            make_preset("eSUN PLA-CF name", vendor="eSUN",
+                        material="PLA"),
+        ]
+        obs = make_obs(vendor="eSUN", material="PLA", product="Pink",
+                       color="#ff0000")
+        for preset in variants:
+            result = core.match_observation(obs, [preset])
+            self.assertEqual(result.preset_name, "", preset.name)
+            self.assertNotEqual(result.source, "installed", preset.name)
+
+    def test_base_preset_still_wins_when_a_cf_variant_exists(self):
+        base = make_preset("eSUN PLA @System", vendor="eSUN", material="PLA")
+        variant = make_preset("eSUN PLA-CF @System", vendor="eSUN",
+                              material="PLA-CF")
+        obs = make_obs(vendor="eSUN", material="PLA", product="Pink",
+                       color="#ff0000")
+        result = core.match_observation(obs, [variant, base])
+        self.assertEqual(result.preset_name, base.name)
+        self.assertEqual(result.source, "installed")
+
+    def test_filament_id_accepts_material_family_split_with_matching_cf(self):
+        preset = make_preset("eSUN PLA-CF @System", vendor="eSUN",
+                             material="PLA", subtype="CF",
+                             filament_id="FID")
+        obs = make_obs(vendor="eSUN", material="PLA-CF", filament_id="FID")
+        result = core.match_observation(obs, [preset])
+        self.assertEqual(result.preset_name, preset.name)
+        self.assertEqual(result.confidence, 100)
+
+    def test_history_accepts_material_family_split_with_matching_cf(self):
+        preset = make_preset("eSUN PLA-CF @System", vendor="eSUN",
+                             material="PLA", subtype="CF")
+        obs = make_obs(vendor="eSUN", material="PLA-CF", product="PLA-CF",
+                       color="#ff0000", spool_id=91)
+        with tempfile.TemporaryDirectory() as directory:
+            store = core.HistoryStore(Path(directory) / "history.json")
+            store.remember(obs, "U1", preset.name)
+            result = core.match_observation(obs, [preset], store, "U1")
+        self.assertEqual(result.source, "history")
+        self.assertEqual(result.preset_name, preset.name)
+
+
 class FilamentIdValidationTests(unittest.TestCase):
     def test_id_with_wrong_vendor_is_not_selected(self):
         preset = make_preset("ACME PETG", vendor="ACME", material="PETG",
