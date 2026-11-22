@@ -11,7 +11,15 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -20,20 +28,62 @@ jobs:
           python-version: "3.12"
 
       - name: Build single-file plugin
-        run: python3 plugin/build_single_file.py
+        run: python plugin/build_single_file.py
 
       - name: Build Orca Cloud artifact
-        run: python3 plugin/build_hub_file.py
+        run: python plugin/build_hub_file.py
+
+      - name: Dry-run versioned Hub build
+        run: |
+          python plugin/build_hub_file.py --version 9.9.9 --out "${{ runner.temp }}/filament_match_any_9.9.9.py"
+          python plugin/check_artifact.py "${{ runner.temp }}/filament_match_any_9.9.9.py" --version 9.9.9
+
+      - name: Rebuild default Hub artifact
+        run: python plugin/build_hub_file.py
 
       - name: Compile all plugin builds
+        run: >-
+          python -m py_compile
+          plugin/filament_match.py
+          plugin/filament_match_core.py
+          plugin/filament_match_sources.py
+          plugin/dist/filament_match.py
+          plugin/hub/filament_match_any.py
+          plugin/dev/orca_hub.py
+          plugin/build_single_file.py
+          plugin/build_hub_file.py
+          plugin/check_version.py
+          plugin/check_hub_description.py
+          plugin/check_artifact.py
+
+      - name: Verify the Windows install steps
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          python3 -m py_compile \
-            plugin/filament_match.py \
-            plugin/filament_match_core.py \
-            plugin/filament_match_sources.py \
-            plugin/dist/filament_match.py \
-            plugin/hub/filament_match_any.py \
-            plugin/dev/orca_hub.py
+          $root = Join-Path $env:RUNNER_TEMP "fm-windows-install"
+          $plugins = Join-Path $root "orca_plugins"
+          $dest = Join-Path $plugins "filament_match"
+          $legacy = Join-Path $plugins "filament_match.py"
+          New-Item -ItemType Directory -Force -Path $legacy | Out-Null
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Set-Content (Join-Path $dest "stale.py") "old"
+          Set-Content (Join-Path $dest "old.whl") "old"
+          if (Test-Path $legacy) { Remove-Item -Recurse -Force $legacy }
+          Get-ChildItem $dest -File |
+            Where-Object { ($_.Extension -in ".py", ".whl") -and $_.Name -ne "filament_match.py" } |
+            Remove-Item -Force
+          Copy-Item plugin\dist\filament_match.py (Join-Path $dest "filament_match.py") -Force
+          '{"enabled": true}' | Set-Content -Encoding ascii (Join-Path $dest ".install_state.json")
+          if (Test-Path $legacy) { throw "legacy plugin path remains" }
+          if (Test-Path (Join-Path $dest "stale.py")) { throw "stale .py remains" }
+          if (Test-Path (Join-Path $dest "old.whl")) { throw "stale .whl remains" }
+          if (-not (Test-Path (Join-Path $dest "filament_match.py"))) { throw "entry file missing" }
+
+      - name: Check release version consistency
+        run: python plugin/check_version.py
+
+      - name: Check Hub description size
+        run: python plugin/check_hub_description.py plugin/HUB_DESCRIPTION.md
 
       - name: Run tests
-        run: python3 -m unittest discover -s plugin/tests -p 'test_*.py' -v
+        run: python -m unittest discover -s plugin/tests -p "test_*.py" -v

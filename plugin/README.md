@@ -1,6 +1,6 @@
 # Filament Match
 
-An OrcaSlicer 2.5+ plugin that reads the filaments loaded in a printer, finds
+An OrcaSlicer 2.5.2+ plugin that reads the filaments loaded in a printer, finds
 the best matching preset for each slot from your installed Orca presets and the
 [Open Filament Database](https://openfilamentdatabase.org/), lets you
 review/edit the detected fields and the match, and remembers confirmed
@@ -16,11 +16,25 @@ cd /path/to/filament-match
 ./plugin/install.sh
 ```
 
+`install.sh` detects `~/Library/Application Support/OrcaSlicer` on macOS and
+`$HOME/.config/OrcaSlicer` on Linux. Pass a data directory to install into a
+clone or a non-default location:
+
+```sh
+./plugin/install.sh "$HOME/Library/Application Support/OrcaSlicer"   # macOS
+./plugin/install.sh "$HOME/.config/OrcaSlicer"                       # Linux
+```
+
 The script builds one file (`plugin/dist/filament_match.py`) and installs it as:
 
 ```
 ~/Library/Application Support/OrcaSlicer/orca_plugins/filament_match/filament_match.py
 ```
+
+It stages the new folder before replacing the old one, so a failed build does
+not leave a partial plugin. It also removes stale direct `.py`/`.whl` files,
+`__pycache__`, and the legacy `orca_plugins/filament_match.py` path, while
+keeping `.install_state.json` and the history/settings data folder.
 
 Restart OrcaSlicer, open **File → Plugins**, enable **Filament Match**, allow
 network access when Orca asks, then run **Plugins → Run → Filament Match**.
@@ -31,7 +45,9 @@ address and the Open Filament Database — rather than once per API path or
 spool. The in-flight request
 may be denied while the dialog is open; approve it and press **↻**.
 
-For Windows/Linux paths and manual install, see [INSTALL.md](INSTALL.md).
+For Windows (including the prebuilt release artifact, Python prerequisite,
+legacy-folder removal and update steps) and manual installs, see
+[INSTALL.md](INSTALL.md).
 
 ## Use
 
@@ -65,6 +81,20 @@ For Windows/Linux paths and manual install, see [INSTALL.md](INSTALL.md).
 The plugin does **not** hook Orca's native “Sync filaments” button; it reads the
 printer itself and leaves Orca's native button untouched.
 
+## Printer and library support
+
+- **Snapmaker** (`print_task_config` + `filament_detect`): per-lane vendor,
+  material, subtype, colour, spool ID and optional temperatures.
+- **Moonraker** (`lane_data`, then `mmu`, then `box`): lanes, material, colour
+  and the native `filament_id`; vendor/product/spool/tag stay blank unless
+  another source supplies them. No fields are invented for an unknown payload.
+- **Open Filament Database**: enabled by default; cached index and preset JSON
+  work offline, while a missing index or uncached preset needs network access.
+- **Spoolman**: optional enrichment and price sync, not a preset source.
+
+See [INSTALL.md](INSTALL.md#supported-printer-and-library-scope) for the full
+scope and [../README.md](../README.md#limitations) for plugin API limits.
+
 ## Matching order
 
 1. A user-confirmed mapping for the exact spool/tag/filament identity, but only
@@ -89,7 +119,9 @@ printer itself and leaves Orca's native button untouched.
 History is stored in Orca's per-plugin data folder:
 
 ```
-~/Library/Application Support/OrcaSlicer/orca_plugins/plugin_data/filament_match/history.json
+macOS:   ~/Library/Application Support/OrcaSlicer/orca_plugins/plugin_data/filament_match/history.json
+Linux:   ~/.config/OrcaSlicer/orca_plugins/plugin_data/filament_match/history.json
+Windows: %APPDATA%\OrcaSlicer\orca_plugins\plugin_data\filament_match\history.json
 ```
 
 It survives restarts and plugin reinstalls. Only user-confirmed matches are
@@ -209,6 +241,10 @@ plugin/
   tests/                     # unittest suites
   dev/mock_printer.py        # editable mock Snapmaker/Moonraker printer
   build_single_file.py       # flatten to one installable .py
+  build_hub_file.py          # generate the Orca Cloud upload artifact
+  check_version.py           # release version consistency check
+  check_hub_description.py   # Hub character/byte limit check
+  check_artifact.py          # validate a built flat/Hub artifact
   install.sh                 # build + install locally
   PLAN.md                    # design and phases
   API_NOTES.md               # verified Orca 2.5.2 plugin API facts
@@ -219,6 +255,10 @@ plugin/
 Run tests:
 
 ```sh
+python3 plugin/build_single_file.py
+python3 plugin/build_hub_file.py
+python3 plugin/check_version.py
+python3 plugin/check_hub_description.py plugin/HUB_DESCRIPTION.md
 python3 -m unittest discover -s plugin/tests -p 'test_*.py' -v
 ```
 

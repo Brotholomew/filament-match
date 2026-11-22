@@ -9,6 +9,11 @@ cd /path/to/filament-match
 ./plugin/install.sh
 ```
 
+The installer detects the default data directory on macOS and Linux. Pass one
+explicitly for a clone: `./plugin/install.sh /path/to/OrcaSlicer`. On Windows,
+follow the PowerShell steps in [INSTALL.md](INSTALL.md#windows), including the
+legacy-folder removal and Python 3.12 prerequisite.
+
 This builds `plugin/dist/filament_match.py` and installs it as the single entry
 file:
 
@@ -16,11 +21,13 @@ file:
 ~/Library/Application Support/OrcaSlicer/orca_plugins/filament_match/filament_match.py
 ```
 
-Restart OrcaSlicer. Open **File → Plugins**. The plugin should be listed as
-**Filament Match**. Activate it and allow:
+The installer preserves `.install_state.json` and the
+`orca_plugins/plugin_data/filament_match/` history/settings folder.
 
-- network access (Moonraker/Spoolman/OFD),
-- threads if prompted.
+Restart OrcaSlicer. Open **File → Plugins**. The plugin should be listed as
+**Filament Match**. Activate it and allow network access (Moonraker/Spoolman/OFD)
+when prompted. The plugin does not start threads, so no thread permission is
+needed.
 
 Then run **Plugins → Run → Filament Match**.
 
@@ -115,7 +122,9 @@ Then run **Plugins → Run → Filament Match**.
 - `begin_update` changes the slot; no crash if the slot count is too small.
 - A `_local` bundle preset is selected by its visible name, not `_local/...`.
 - History is written to:
-  `~/Library/Application Support/OrcaSlicer/orca_plugins/plugin_data/filament_match/history.json`
+  - macOS: `~/Library/Application Support/OrcaSlicer/orca_plugins/plugin_data/filament_match/history.json`
+  - Linux: `~/.config/OrcaSlicer/orca_plugins/plugin_data/filament_match/history.json`
+  - Windows: `%APPDATA%\OrcaSlicer\orca_plugins\plugin_data\filament_match\history.json`
 - Delete that file while Orca is closed to reset history.
 - If the printer is offline, the plugin shows an error and does not crash.
 - If Spoolman is unreachable, matching still works from printer data.

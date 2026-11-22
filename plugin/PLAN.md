@@ -1,6 +1,6 @@
 # Filament Match — implementation plan
 
-**Goal:** an OrcaSlicer 2.5+ plugin that reads the filaments loaded in a printer,
+**Goal:** an OrcaSlicer 2.5.2+ plugin that reads the filaments loaded in a printer,
 matches each one to an Orca filament preset, lets the user review/edit the
 detected fields and the chosen preset, and remembers confirmed
 spool/tag/filament → preset mappings across Orca restarts.

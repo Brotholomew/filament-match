@@ -2,7 +2,7 @@
 
 **Stop hand-building filament presets.**
 
-With Filament Match, you don't have to manually create a preset for every spool or limit yourself to the Orca presets you already have. It reads the filament data exposed by your printer and finds the best matching preset using the [Open Filament Database](https://openfilamentdatabase.org/) — an open catalogue of community filament profiles — alongside your installed Orca presets. OFD matching is enabled by default. Spoolman users can sync prices with their chosen instance.
+With Filament Match, you don't have to manually create a preset for every spool or limit yourself to the Orca presets you already have. It reads the filament data exposed by your printer and finds the best matching preset using the [Open Filament Database](https://openfilamentdatabase.org/) — an open catalogue of filament profiles — alongside your installed Orca presets. OFD matching is enabled by default. Spoolman users can sync prices with their chosen instance.
 
 Filament Match is the review layer between your printer and Orca. It remembers the spool, tag and filament mappings you confirm.
 
@@ -30,7 +30,7 @@ The Open Filament Database is a community catalogue of filament profiles. Filame
 3. Click **Subscribe**, then enable **Activate** for the plugin.
 4. Restart OrcaSlicer if the plugin does not appear immediately. Open **File → Plugins → Filament Match → Run plugin**, or use the Speed Dial.
 
-Orca Cloud plugins are a beta feature. Use a current OrcaSlicer build with plugin support; `2.5.2` is the tested version.
+Orca Cloud plugins are a beta feature. Filament Match requires OrcaSlicer `2.5.2` or newer.
 
 ### Install from source
 
