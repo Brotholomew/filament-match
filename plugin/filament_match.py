@@ -1339,11 +1339,36 @@ def _url_has_port(url):
     try:
         return urllib.parse.urlsplit(url).port is not None
     except ValueError:
-        return True
+        # An unbracketed IPv6 literal is a host, not a port.
+        return False
+
+
+def _append_url_port(base, port):
+    """Append a configured port, bracketing a bare IPv6 host."""
+    parts = urllib.parse.urlsplit(base)
+    netloc = parts.netloc
+    userinfo = ""
+    if "@" in netloc:
+        userinfo, netloc = netloc.rsplit("@", 1)
+        userinfo += "@"
+    if not netloc:
+        return base
+    if not netloc.startswith("[") and netloc.count(":") > 1:
+        # Unbracketed IPv6 literal: the whole netloc is the host.
+        netloc = "[%s]" % netloc
+    netloc = "%s%s:%s" % (userinfo, netloc, port)
+    return urllib.parse.urlunsplit(
+        (parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 def _printer_base_urls(info):
-    """Candidate base URLs for the active printer, best first."""
+    """The single base URL to query for the active printer.
+
+    Orca's configured host/port are authoritative. A bare host has no probing
+    fallback: Snapmaker serves the API on its configured web host, while a
+    generic Moonraker printer uses the standard 7125 port. Returning one URL
+    keeps one network preflight/permission prompt per scan.
+    """
     base = _normalize_host((info or {}).get("host"))
     if not base:
         return []
@@ -1351,16 +1376,14 @@ def _printer_base_urls(info):
     if parts.path not in ("", "/") or parts.query:
         return [base]
     configured_port = _text((info or {}).get("port"))
-    if configured_port and not _url_has_port(base):
-        return [base + ":" + configured_port]
     if _url_has_port(base):
         return [base]
-    # A bare print host has no port. Snapmaker's print host serves the API on
-    # its web port; generic Moonraker installs use 7125.
+    if configured_port:
+        return [_append_url_port(base, configured_port)]
     agent = _text((info or {}).get("agent")).casefold()
     if "snapmaker" in agent:
-        return [base, base + ":7125"]
-    return [base + ":7125", base]
+        return [base]
+    return [_append_url_port(base, "7125")]
 
 
 def _parse_printer_result(result):
@@ -1395,14 +1418,21 @@ def _read_printer(snapshot, warnings):
             "rescan (↻) button.")
     reader = _DEPS["read_printer"]
     api_key = _text(info.get("api_key"))
+    agent = _text(info.get("agent"))
+    configured_port = _text(info.get("port"))
     attempts = []
     for url in urls:
         _preflight_host(url)
         try:
+            kwargs = {"timeout": 4.0, "agent": agent}
+            if configured_port:
+                kwargs["port"] = configured_port
             try:
-                result = reader(url, api_key, timeout=4.0)
+                result = reader(url, api_key, **kwargs)
             except TypeError:
-                result = reader(base_url=url, api_key=api_key)
+                # Older Sources builds do not accept agent/port. Fall back to
+                # the legacy call so the entry point still works unmerged.
+                result = reader(url, api_key, timeout=4.0)
         except Exception as error:
             hint = _permission_hint(error)
             if hint:
@@ -1428,17 +1458,18 @@ def _spoolman_client(settings, session, warnings):
     url = _text(settings.get("spoolman_url"))
     if not url:
         return None
-    if not re.match(r"^https?://[^/]+", url):
-        _warn(warnings, "Spoolman URL must start with http:// or https://")
-        return None
     cached = session.get("spoolman_client")
-    if cached is not None and session.get("spoolman_url") == url:
+    if (cached is not None and session.get("spoolman_url") == url
+            and _text(getattr(cached, "base_url", ""))):
         return cached
     cls = _DEPS["SpoolmanClient"]
     try:
         client = cls(url)
     except TypeError:
         client = cls(base_url=url)
+    if not _text(getattr(client, "base_url", "")):
+        _warn(warnings, "Spoolman URL is not usable. Fix it in Settings.")
+        return None
     session["spoolman_client"] = client
     session["spoolman_url"] = url
     session["spoolman_cache"] = {}
@@ -1475,14 +1506,6 @@ def _enrich_spoolman(observations, settings, session, warnings):
     if not url:
         session["spoolman_status"] = status
         return
-    if not re.match(r"^https?://[^/]+", url):
-        status["message"] = (
-            "Fix the Spoolman URL in Settings; it must start with http:// or "
-            "https://."
-        )
-        session["spoolman_status"] = status
-        _warn(warnings, "Spoolman URL must start with http:// or https://")
-        return
     try:
         client = _spoolman_client(settings, session, warnings)
     except Exception as error:
@@ -1500,7 +1523,8 @@ def _enrich_spoolman(observations, settings, session, warnings):
         session["spoolman_status"] = status
         return
     try:
-        _preflight_host(getattr(client, "base_url", "") or url)
+        _preflight_host(_normalize_host(
+            getattr(client, "base_url", "") or url))
     except RuntimeError as error:
         status["message"] = (
             "Spoolman is not reachable. Fix the URL in Settings and rescan."
@@ -1592,7 +1616,7 @@ def _fetch_spoolman_price(settings, session, warnings, observation_values):
             "Spoolman is not reachable: %s" % _error_text(error)))
     if client is None:
         raise ValueError("Fix the Spoolman URL in Settings and rescan.")
-    _preflight_host(getattr(client, "base_url", "") or url)
+    _preflight_host(_normalize_host(getattr(client, "base_url", "") or url))
     # Force a fresh spool record so a price changed in Spoolman after the scan
     # is visible to this explicit fetch.
     session.setdefault("spoolman_cache", {}).pop(str(spool_id), None)
@@ -1608,21 +1632,46 @@ def _fetch_spoolman_price(settings, session, warnings, observation_values):
 def _clear_ofd_cache(storage, session=None):
     """Delete the local OFD index and preset JSON cache.
 
-    History, settings and installed presets are untouched. The next scan builds
-    a new OfdLibrary, so fresh data is downloaded from OFD.
+    Sources scopes cache files by index URL (``ofd_index-<hash>.json`` and
+    ``ofd_presets-*/`` or ``ofd_presets/<hash>/``). Remove every scoped variant
+    as well as the legacy unscoped paths so switching indexes cannot leave an
+    old cache behind. History, settings and installed presets are untouched.
     """
-    index_path = os.path.join(_text(storage), "ofd_index.json")
-    preset_dir = os.path.join(_text(storage), "ofd_presets")
-    removed_index = False
+    storage = _text(storage)
+    preset_dir = os.path.join(storage, "ofd_presets")
+    index_paths = []
+    preset_paths = []
+    try:
+        entries = os.listdir(storage) if storage and os.path.isdir(storage) else []
+    except OSError as error:
+        raise RuntimeError(
+            "Could not clear the OFD cache: %s" % _error_text(error))
+    for name in entries:
+        path = os.path.join(storage, name)
+        if name == "ofd_index" or name == "ofd_index.json" or name.startswith(
+                ("ofd_index-", "ofd_index_")):
+            index_paths.append(path)
+        elif name == "ofd_presets" or name.startswith(("ofd_presets-", "ofd_presets_")):
+            preset_paths.append(path)
+    removed_index = 0
     removed_presets = 0
     try:
-        if os.path.isfile(index_path):
-            os.remove(index_path)
-            removed_index = True
-        if os.path.isdir(preset_dir):
-            for _root, _dirs, files in os.walk(preset_dir):
-                removed_presets += len(files)
-            shutil.rmtree(preset_dir)
+        for path in index_paths:
+            if os.path.isfile(path):
+                os.remove(path)
+                removed_index += 1
+            elif os.path.isdir(path):
+                for _root, _dirs, files in os.walk(path):
+                    removed_index += len(files)
+                shutil.rmtree(path)
+        for path in preset_paths:
+            if os.path.isdir(path):
+                for _root, _dirs, files in os.walk(path):
+                    removed_presets += len(files)
+                shutil.rmtree(path)
+            elif os.path.isfile(path):
+                os.remove(path)
+                removed_presets += 1
     except OSError as error:
         raise RuntimeError(
             "Could not clear the OFD cache: %s" % _error_text(error))
@@ -1630,7 +1679,8 @@ def _clear_ofd_cache(storage, session=None):
         session["ofd_library"] = None
         session["ofd_key"] = None
     return {
-        "index_removed": removed_index,
+        "index_removed": bool(removed_index),
+        "index_files_removed": removed_index,
         "preset_files_removed": removed_presets,
         "preset_dir": preset_dir,
     }

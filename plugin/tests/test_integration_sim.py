@@ -427,12 +427,75 @@ class IntegrationSimulationTests(unittest.TestCase):
             "host": "", "selected": {"connected": True, "online": True}})
         self.assertIn("print host", problem.casefold())
 
-    def test_printer_base_url_prefers_snapmaker_web_port(self):
-        urls = self.module._printer_base_urls(
-            {"host": "10.0.0.176", "agent": "snapmaker"})
-        self.assertEqual(urls, ["http://10.0.0.176", "http://10.0.0.176:7125"])
-        urls = self.module._printer_base_urls({"host": "moon.local", "agent": "moonraker"})
-        self.assertEqual(urls, ["http://moon.local:7125", "http://moon.local"])
+    def test_printer_base_url_returns_one_configured_or_agent_url(self):
+        self.assertEqual(
+            self.module._printer_base_urls(
+                {"host": "10.0.0.176", "agent": "snapmaker"}),
+            ["http://10.0.0.176"])
+        self.assertEqual(
+            self.module._printer_base_urls(
+                {"host": "moon.local", "agent": "moonraker"}),
+            ["http://moon.local:7125"])
+        self.assertEqual(
+            self.module._printer_base_urls(
+                {"host": "10.0.0.176", "port": "7912",
+                 "agent": "snapmaker"}),
+            ["http://10.0.0.176:7912"])
+        self.assertEqual(
+            self.module._printer_base_urls(
+                {"host": "http://10.0.0.176:7912", "port": "9999"}),
+            ["http://10.0.0.176:7912"])
+        self.assertEqual(
+            self.module._printer_base_urls(
+                {"host": "fd00::1", "agent": "moonraker"}),
+            ["http://[fd00::1]:7125"])
+        self.assertEqual(
+            self.module._printer_base_urls(
+                {"host": "fd00::1", "port": "7912"}),
+            ["http://[fd00::1]:7912"])
+
+    def test_read_printer_passes_agent_and_configured_port(self):
+        calls = []
+
+        def reader(url, api_key="", *, timeout=0, agent="", port=None):
+            calls.append((url, api_key, timeout, agent, port))
+            return ([self.observation_type(
+                slot=1, present=True, vendor="Prusament", material="PLA",
+                source="moonraker")], [])
+
+        original = self.module._DEPS["read_printer"]
+        self.module._DEPS["read_printer"] = reader
+        try:
+            observations = self.module._read_printer({
+                "printer_info": {
+                    "host": "10.0.0.50", "port": "7912", "agent": "moonraker",
+                },
+            }, [])
+        finally:
+            self.module._DEPS["read_printer"] = original
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(calls, [("http://10.0.0.50:7912", "", 4.0,
+                                  "moonraker", "7912")])
+
+    def test_read_printer_falls_back_for_legacy_reader_signature(self):
+        calls = []
+
+        def reader(url, api_key="", timeout=0):
+            calls.append((url, api_key, timeout))
+            return ([self.observation_type(
+                slot=1, present=True, vendor="Prusament", material="PLA",
+                source="snapmaker")], [])
+
+        original = self.module._DEPS["read_printer"]
+        self.module._DEPS["read_printer"] = reader
+        try:
+            observations = self.module._read_printer({
+                "printer_info": {"host": "10.0.0.176", "agent": "snapmaker"},
+            }, [])
+        finally:
+            self.module._DEPS["read_printer"] = original
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(calls, [("http://10.0.0.176", "", 4.0)])
 
     def test_scan_matches_each_slot_and_keeps_label(self):
         reply = self._scan()
@@ -840,6 +903,71 @@ class IntegrationSimulationTests(unittest.TestCase):
         })
         self.assertIn("Add a Spoolman URL", no_url["price_error"]["error"])
 
+    def test_spoolman_client_accepts_bare_host_and_api_suffix(self):
+        original = self.module._DEPS["SpoolmanClient"]
+        seen = []
+
+        class Client:
+            def __init__(self, base_url):
+                seen.append(base_url)
+                self.base_url = base_url.rstrip("/")
+
+        self.module._DEPS["SpoolmanClient"] = Client
+        warnings = []
+        try:
+            client = self.module._spoolman_client(
+                {"spoolman_url": "spoolman.local:7912/api/v1"}, {}, warnings)
+        finally:
+            self.module._DEPS["SpoolmanClient"] = original
+        self.assertIsNotNone(client)
+        self.assertEqual(seen, ["spoolman.local:7912/api/v1"])
+        self.assertEqual(warnings, [])
+
+    def test_spoolman_client_reports_an_unusable_client(self):
+        original = self.module._DEPS["SpoolmanClient"]
+
+        class Client:
+            def __init__(self, base_url):
+                self.base_url = ""
+
+        self.module._DEPS["SpoolmanClient"] = Client
+        warnings = []
+        try:
+            client = self.module._spoolman_client(
+                {"spoolman_url": "spoolman.local"}, {}, warnings)
+        finally:
+            self.module._DEPS["SpoolmanClient"] = original
+        self.assertIsNone(client)
+        self.assertTrue(any("not usable" in warning for warning in warnings))
+
+    def test_enrich_spoolman_accepts_bare_host(self):
+        original = self.module._DEPS["SpoolmanClient"]
+
+        class Client:
+            base_url = "http://spoolman.local:7912"
+
+            def __init__(self, base_url):
+                self.base_url = "http://spoolman.local:7912"
+
+            def get_spool(self, spool_id):
+                return {"price": 20.00, "initial_weight": 1000,
+                        "filament": {"name": "PETG", "weight": 1000}}
+
+        self.module._DEPS["SpoolmanClient"] = Client
+        session = {}
+        warnings = []
+        observation = self.observation_type(
+            slot=1, present=True, vendor="eSUN", material="PETG", spool_id=9)
+        try:
+            self.module._enrich_spoolman(
+                [observation], {"spoolman_url": "spoolman.local:7912"},
+                session, warnings)
+        finally:
+            self.module._DEPS["SpoolmanClient"] = original
+        self.assertTrue(session["spoolman_status"]["available"])
+        self.assertEqual(session["spool_prices"]["9"], "20.00")
+        self.assertEqual(warnings, [])
+
     def test_price_copy_of_user_preset_flattens_its_parent(self):
         user_path = (Path(self.storage) / "user" / "profile" / "filament" /
                      "CC3D PETG (custom).json")
@@ -997,6 +1125,35 @@ class IntegrationSimulationTests(unittest.TestCase):
         self.assertFalse(empty["cache_cleared"]["index_removed"])
         self.assertEqual(empty["cache_cleared"]["preset_files_removed"], 0)
         self.assertIn("already empty", empty["message"])
+
+    def test_clear_cache_removes_scoped_ofd_variants(self):
+        storage = Path(self.storage)
+        (storage / "ofd_index.json").write_text("{}", encoding="utf-8")
+        (storage / "ofd_index-abc123.json").write_text("{}", encoding="utf-8")
+        (storage / "ofd_index-def456.json").write_text("{}", encoding="utf-8")
+        index_dir = storage / "ofd_index-ghi789"
+        index_dir.mkdir(parents=True)
+        (index_dir / "ofd_index.json").write_text("{}", encoding="utf-8")
+        legacy = storage / "ofd_presets" / "brands" / "legacy"
+        legacy.mkdir(parents=True)
+        (legacy / "one.json").write_text("{}", encoding="utf-8")
+        scoped = storage / "ofd_presets-abc123" / "brands" / "new"
+        scoped.mkdir(parents=True)
+        (scoped / "two.json").write_text("{}", encoding="utf-8")
+        (scoped / "three.json").write_text("{}", encoding="utf-8")
+        (storage / "settings.json").write_text("{}", encoding="utf-8")
+
+        removed = self.module._clear_ofd_cache(self.storage)
+        self.assertTrue(removed["index_removed"])
+        self.assertEqual(removed["index_files_removed"], 4)
+        self.assertEqual(removed["preset_files_removed"], 3)
+        self.assertFalse((storage / "ofd_index.json").exists())
+        self.assertFalse((storage / "ofd_index-abc123.json").exists())
+        self.assertFalse((storage / "ofd_index-def456.json").exists())
+        self.assertFalse((storage / "ofd_index-ghi789").exists())
+        self.assertFalse((storage / "ofd_presets").exists())
+        self.assertFalse((storage / "ofd_presets-abc123").exists())
+        self.assertTrue((storage / "settings.json").exists())
 
     def test_library_install_uses_cached_preset_without_network(self):
         fixtures = Path(__file__).resolve().parent / "fixtures"
@@ -1550,6 +1707,34 @@ class IntegrationSimulationTests(unittest.TestCase):
         (data / "user" / "default" / "filament").mkdir(parents=True)
         self.assertEqual(
             self.module._discover_user_folder(str(data))[0], "default")
+
+    def test_system_only_profile_installs_into_existing_default_folder(self):
+        data = Path(self.storage) / "default-data"
+        (data / "user" / "default" / "machine").mkdir(parents=True)
+        self.bundle = FakeBundle([
+            FakePreset("Generic PLA @Test", vendor="Generic", material="PLA"),
+        ], [], printer="Snapmaker U1 (0.4 nozzle)")
+        original = self.module._data_dir_from_plugin
+        self.module._data_dir_from_plugin = lambda: str(data)
+        try:
+            snapshot = self._snapshot()
+            self.assertEqual(snapshot["folder"], "default")
+            self.assertTrue(snapshot["folder_inferred"])
+            written = self.module._write_local_preset({
+                "name": "CC3D PLA (OFD)",
+                "from": "User",
+                "type": "filament",
+                "instantiation": "true",
+                "inherits": "Generic PLA @Test",
+                "filament_type": ["PLA"],
+                "filament_vendor": ["CC3D"],
+            }, snapshot)
+        finally:
+            self.module._data_dir_from_plugin = original
+        self.assertEqual(written, "CC3D PLA (OFD)")
+        self.assertTrue(
+            (data / "user" / "default" / "_local" / "filament_match" /
+             "filament" / "CC3D PLA (OFD).json").exists())
 
     def test_snapshot_discovers_user_folder_for_system_only_profile(self):
         data = Path(self.storage) / "data"
