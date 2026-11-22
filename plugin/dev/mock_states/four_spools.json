@@ -1,0 +1,54 @@
+{
+  "mode": "both",
+  "printer": "Mock Snapmaker U1 (4 spools)",
+  "feeders": [
+    {
+      "present": true,
+      "vendor": "3DJake",
+      "material": "ABS",
+      "subtype": "",
+      "product": "ABS Pastel Pink",
+      "color": "#F49BAD",
+      "spool_id": 6,
+      "filament_id": "",
+      "bed_temp": 100,
+      "nozzle_temp": 250
+    },
+    {
+      "present": true,
+      "vendor": "CC3D",
+      "material": "PETG",
+      "subtype": "",
+      "product": "PETG Pink",
+      "color": "#FAB9E1",
+      "spool_id": 8,
+      "filament_id": "",
+      "bed_temp": 80,
+      "nozzle_temp": 240
+    },
+    {
+      "present": true,
+      "vendor": "eSUN",
+      "material": "PETG",
+      "subtype": "",
+      "product": "PETG Basic Transparent Green",
+      "color": "#03720A",
+      "spool_id": 9,
+      "filament_id": "",
+      "bed_temp": 80,
+      "nozzle_temp": 240
+    },
+    {
+      "present": true,
+      "vendor": "The Filament",
+      "material": "PLA",
+      "subtype": "Lite",
+      "product": "PLA Lite White",
+      "color": "#FFFFFF",
+      "spool_id": 0,
+      "filament_id": "",
+      "bed_temp": 50,
+      "nozzle_temp": 210
+    }
+  ]
+}

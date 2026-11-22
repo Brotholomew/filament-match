@@ -1,0 +1,23 @@
+[
+  {
+    "id": 7,
+    "name": "PolyLite PLA",
+    "material": "PLA",
+    "extra": {
+      "orca_preset": "\"Polymaker PolyLite PLA @U1\""
+    }
+  },
+  {
+    "id": 8,
+    "name": "PETG Basic",
+    "material": "PETG",
+    "extra": {
+      "orca_preset": "\"CC3D PETG @U1\"",
+      "orca_filament_preset": "\"CC3D PETG @U1\""
+    }
+  },
+  {
+    "id": 9,
+    "name": "No extra"
+  }
+]

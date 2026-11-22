@@ -1,0 +1,32 @@
+{
+  "result": {
+    "status": {
+      "print_task_config": {
+        "filament_exist": [true, true, true, false],
+        "filament_type": ["PLA", "PETG", "PLA", ""],
+        "filament_sub_type": ["SnapSpeed", "NONE", "Matte", ""],
+        "filament_color_rgba": ["#F06292FF", "#FF3D00", "#None", ""],
+        "filament_vendor": ["Polymaker", "", "Snapmaker", ""],
+        "filament_spool_id": [42, 0, 7, -1]
+      },
+      "filament_detect": {
+        "info": [
+          {
+            "BED_TEMP": 60,
+            "HOTEND_MAX_TEMP": 230
+          },
+          {
+            "BED_TEMP": "80",
+            "HOTEND_MAX_TEMP": "250"
+          },
+          {
+            "BED_TEMP": 0,
+            "HOTEND_MAX_TEMP": null
+          },
+          {}
+        ]
+      }
+    },
+    "eventtime": 1795280000.25
+  }
+}

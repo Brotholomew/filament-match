@@ -1,0 +1,59 @@
+{
+  "version": "test-2026.11.21",
+  "slicer": "orcaslicer",
+  "profile_count": 4,
+  "profiles": [
+    {
+      "id": "p1",
+      "brand": "Polymaker",
+      "brand_slug": "polymaker",
+      "material": "PLA",
+      "filament": "PolyLite PLA",
+      "filament_slug": "polylite_pla",
+      "profile_name": "Polymaker PolyLite PLA (OFD)",
+      "inherits": "Generic PLA @System",
+      "orca_filament_code": null,
+      "path": "brands/polymaker/materials/PLA/filaments/polylite_pla.json",
+      "source": "https://api.openfilamentdatabase.org/api/v1/brands/polymaker/materials/PLA/filaments/polylite_pla/index.json"
+    },
+    {
+      "id": "p2",
+      "brand": "Polymaker",
+      "brand_slug": "polymaker",
+      "material": "PLA",
+      "filament": "PolyLite PLA Matte",
+      "filament_slug": "polylite_pla_matte",
+      "profile_name": "Polymaker PolyLite PLA Matte (OFD)",
+      "inherits": "Generic PLA Matte @System",
+      "orca_filament_code": null,
+      "path": "brands/polymaker/materials/PLA/filaments/polylite_pla_matte.json",
+      "source": "https://api.openfilamentdatabase.org/api/v1/brands/polymaker/materials/PLA/filaments/polylite_pla_matte/index.json"
+    },
+    {
+      "id": "p3",
+      "brand": "eSUN",
+      "brand_slug": "esun",
+      "material": "PETG",
+      "filament": "PETG Basic",
+      "filament_slug": "petg_basic",
+      "profile_name": "eSUN PETG Basic (OFD)",
+      "inherits": "Generic PETG @System",
+      "orca_filament_code": null,
+      "path": "brands/esun/materials/PETG/filaments/petg_basic.json",
+      "source": "https://api.openfilamentdatabase.org/api/v1/brands/esun/materials/PETG/filaments/petg_basic/index.json"
+    },
+    {
+      "id": "p4",
+      "brand": "Prusament",
+      "brand_slug": "prusament",
+      "material": "PLA",
+      "filament": "PLA Galaxy Black",
+      "filament_slug": "pla_galaxy_black",
+      "profile_name": "Prusament PLA Galaxy Black (OFD)",
+      "inherits": "Generic PLA @System",
+      "orca_filament_code": null,
+      "path": "brands/prusament/materials/PLA/filaments/pla_galaxy_black.json",
+      "source": "https://api.openfilamentdatabase.org/api/v1/brands/prusament/materials/PLA/filaments/pla_galaxy_black/index.json"
+    }
+  ]
+}

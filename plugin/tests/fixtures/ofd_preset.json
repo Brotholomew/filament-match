@@ -1,0 +1,12 @@
+{
+  "name": "Polymaker PolyLite PLA (OFD)",
+  "from": "User",
+  "inherits": "Generic PLA @System",
+  "filament_type": ["PLA"],
+  "filament_vendor": ["Polymaker"],
+  "filament_settings_id": ["Polymaker PolyLite PLA (OFD)"],
+  "nozzle_temperature": ["220"],
+  "bed_temperature": ["60"],
+  "filament_density": ["1.24"],
+  "version": "2.0.2.0"
+}

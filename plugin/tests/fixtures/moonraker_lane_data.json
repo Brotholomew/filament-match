@@ -1,0 +1,48 @@
+{
+  "result": {
+    "namespace": "lane_data",
+    "value": {
+      "lane1": {
+        "lane": "0",
+        "material": "PETG",
+        "color": "#00FF00FF",
+        "bed_temp": 80,
+        "nozzle_temp": 250
+      },
+      "lane2": {
+        "lane": "1",
+        "material": "PLA",
+        "color": "#0000FF",
+        "filament_id": "OFDSrzZ8",
+        "spool_id": 101,
+        "bed_temp": 60,
+        "nozzle_temp": 210,
+        "vendor_name": "eSUN"
+      },
+      "lane3": {
+        "lane": "2",
+        "material": "",
+        "color": "#None",
+        "spool_id": null
+      },
+      "lane4": {
+        "lane": "3",
+        "material": "ABS",
+        "color": "#112233",
+        "filament_id": "GFABS",
+        "spool_id": 5,
+        "bed_temp": 100,
+        "nozzle_temp": 260
+      },
+      "lane5": {
+        "lane": "4",
+        "material": "TPU",
+        "color": "#112233AA",
+        "filament_id": "OFTPU",
+        "spool_id": 9,
+        "bed_temp": 50,
+        "nozzle_temp": 240
+      }
+    }
+  }
+}

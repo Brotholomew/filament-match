@@ -1,0 +1,16 @@
+{
+  "id": 7,
+  "name": "PolyLite PLA",
+  "vendor": {
+    "id": 1,
+    "name": "Polymaker"
+  },
+  "material": "PLA",
+  "color_hex": "F06292",
+  "settings_extruder_temp": 230,
+  "settings_bed_temp": 60,
+  "extra": {
+    "variant": "\"Matte\"",
+    "orca_preset": "\"Polymaker PolyLite PLA @U1\""
+  }
+}

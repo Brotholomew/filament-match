@@ -1,0 +1,31 @@
+{
+  "id": 42,
+  "registered": "2026-11-20T12:00:00Z",
+  "filament": {
+    "id": 7,
+    "name": "PolyLite PLA",
+    "vendor": {
+      "id": 1,
+      "name": "Polymaker"
+    },
+    "material": "PLA",
+    "color_hex": "F06292",
+    "settings_extruder_temp": 230,
+    "settings_bed_temp": 60,
+    "extra": {
+      "variant": "\"Matte\"",
+      "orca_preset": "\"Fallback Preset\""
+    }
+  },
+  "remaining_weight": 812.5,
+  "extra": {
+    "orca_filament_preset": "\"Polymaker PolyLite PLA @U1\"",
+    "orca_preset": "\"CC3D PETG @U1\"",
+    "density": "1.24",
+    "empty_spool_weight": "null",
+    "card_uids": "[\"04A7B2C3D4E5F6\"]",
+    "flag": "true",
+    "notes": "not json",
+    "nested": "{\"value\": 3}"
+  }
+}

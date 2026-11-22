@@ -1,0 +1,21 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Generated build artifacts
+plugin/dist/
+plugin/hub/filament_match_any.py
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.log
