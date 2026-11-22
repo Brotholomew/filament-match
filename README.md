@@ -339,6 +339,8 @@ plugin/
   dev/mock_printer.py        # editable mock Snapmaker/Moonraker printer
   build_single_file.py       # flatten to one installable .py
   build_hub_file.py          # generate the Orca Cloud upload artifact
+  dev/orca_hub.py            # read/update the Orca Cloud listing metadata
+  dev/ORCA_HUB.md            # one-time sign-in and metadata commands
   install.sh                 # build and install locally
   PLAN.md                    # design and phases
   API_NOTES.md               # verified Orca 2.5.2 plugin API notes
@@ -391,3 +393,13 @@ uploading, so the file header and `PLUGIN_VERSION` always match the release.
 
 See [plugin/HUB_PUBLISHING.md](plugin/HUB_PUBLISHING.md) for the Hub listing
 fields and the GitHub publishing setup.
+
+GitHub OIDC can publish releases but cannot edit listing metadata. To read or
+update the Hub listing description, tags or visibility, use the account-session
+helper in [plugin/dev/ORCA_HUB.md](plugin/dev/ORCA_HUB.md):
+
+```sh
+python3 plugin/dev/orca_hub.py login
+python3 plugin/dev/orca_hub.py show
+python3 plugin/dev/orca_hub.py update --description-file plugin/HUB_DESCRIPTION.md
+```

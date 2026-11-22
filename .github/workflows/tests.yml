@@ -32,7 +32,8 @@ jobs:
             plugin/filament_match_core.py \
             plugin/filament_match_sources.py \
             plugin/dist/filament_match.py \
-            plugin/hub/filament_match_any.py
+            plugin/hub/filament_match_any.py \
+            plugin/dev/orca_hub.py
 
       - name: Run tests
         run: python3 -m unittest discover -s plugin/tests -p 'test_*.py' -v

@@ -58,6 +58,24 @@ The metadata in the generated file is:
 Edit `plugin/build_hub_file.py` to change the author or description, then
 regenerate the file.
 
+## Updating the listing metadata
+
+The GitHub publishing credential is accepted only by
+`/api/v1/plugin-publish/releases`. It returns `401 invalid_token` for
+`/api/v1/plugins/*`, so metadata edits need an Orca Cloud account session.
+
+Use the helper in [dev/ORCA_HUB.md](dev/ORCA_HUB.md):
+
+```sh
+python3 plugin/dev/orca_hub.py login
+python3 plugin/dev/orca_hub.py show
+python3 plugin/dev/orca_hub.py update --description-file plugin/HUB_DESCRIPTION.md
+```
+
+The session is stored in `.secrets/orca_cloud.json`, which is ignored by git.
+It is separate from OrcaSlicer's own session and is not needed by the released
+plugin.
+
 ## GitHub publishing
 
 After the listing exists, open **Edit plugin → GitHub publishing**, enter
@@ -75,8 +93,8 @@ python3 plugin/build_hub_file.py --version "${GITHUB_REF_NAME#v}"
 ```
 
 The GitHub release tag must be a higher semantic version than the published
-plugin version. The first repository release is `v0.8.0`; later releases could
-be `v0.8.1` or `v0.9.0`. The `--version` override updates both the file header
+plugin version. `v0.8.0` was the first successful repository release; later
+releases could be `v0.8.1` or `v0.9.0`. The `--version` override updates both the file header
 and `PLUGIN_VERSION` so the uploaded code matches the release tag.
 
 ## Local development build
