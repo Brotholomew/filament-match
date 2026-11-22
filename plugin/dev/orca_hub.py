@@ -22,6 +22,7 @@ import json
 import os
 import secrets
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -40,6 +41,8 @@ DEFAULT_PLUGIN_ID = os.environ.get(
     "ORCA_PLUGIN_ID",
     "3031b85e-07ce-4925-90fa-ba93ccde1c53",
 )
+DESCRIPTION_MAX_CHARS = 10_000
+DESCRIPTION_MAX_BYTES = 10_000
 SESSION_PATH = Path(
     os.environ.get(
         "ORCA_HUB_SESSION",
@@ -85,15 +88,54 @@ def _request(url, *, method="GET", token="", json_body=None, form_body=None,
 
 
 def _save_session(session):
-    SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
+    """Atomically write the session with owner-only permissions.
+
+    ``mkstemp`` creates the file with mode ``0600`` before any token is written,
+    unlike ``write_text`` followed by ``chmod``. That closes the window where a
+    refresh token was briefly readable by other local users.
+    """
+    parent = SESSION_PATH.parent
+    created = not parent.exists()
+    parent.mkdir(parents=True, exist_ok=True)
+    if created or parent.name == ".secrets":
+        try:
+            parent.chmod(0o700)
+        except OSError:
+            pass
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".orca_cloud.", suffix=".tmp", dir=str(SESSION_PATH.parent))
+    temporary = Path(temporary_name)
     try:
-        SESSION_PATH.parent.chmod(0o700)
-    except OSError:
-        pass
-    temp = SESSION_PATH.with_suffix(".tmp")
-    temp.write_text(json.dumps(session, indent=2) + "\n", encoding="utf-8")
-    temp.chmod(0o600)
-    temp.replace(SESSION_PATH)
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            stream.write(json.dumps(session, indent=2) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, SESSION_PATH)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _check_description(description):
+    characters = len(description)
+    byte_count = len(description.encode("utf-8"))
+    if characters > DESCRIPTION_MAX_CHARS:
+        raise HubError(
+            "description is %s characters; Orca Cloud allows at most %s" %
+            (format(characters, ","), format(DESCRIPTION_MAX_CHARS, ",")))
+    if byte_count > DESCRIPTION_MAX_BYTES:
+        raise HubError(
+            "description is %s UTF-8 bytes; Orca Cloud allows at most %s" %
+            (format(byte_count, ","), format(DESCRIPTION_MAX_BYTES, ",")))
+    return characters, byte_count
 
 
 def _load_session():
@@ -275,7 +317,9 @@ def command_show(args):
     summary = _plugin_summary(plugin)
     for key, value in summary.items():
         print("%s: %s" % (key, value))
-    print("description: %d characters" % len(plugin.get("description") or ""))
+    description = plugin.get("description") or ""
+    print("description: %d characters, %d UTF-8 bytes" %
+          (len(description), len(description.encode("utf-8"))))
 
 
 def command_update(args):
@@ -292,7 +336,8 @@ def command_update(args):
         "compatible_orcaslicer_version": plugin.get("compatible_orcaslicer_version"),
     }
     if args.description_file:
-        payload["description"] = Path(args.description_file).read_text(encoding="utf-8")
+        payload["description"] = Path(args.description_file).read_text(
+            encoding="utf-8-sig")
     if args.description is not None:
         payload["description"] = args.description
     if args.name:
@@ -312,7 +357,10 @@ def command_update(args):
 
     if not payload["description"].strip():
         raise HubError("The plugin description cannot be empty.")
+    characters, byte_count = _check_description(payload["description"])
     if args.dry_run:
+        print("description: %d characters, %d UTF-8 bytes" %
+              (characters, byte_count))
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return
     _, response = _api(

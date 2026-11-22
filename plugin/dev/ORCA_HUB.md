@@ -21,9 +21,10 @@ the Orca Cloud sign-in page, and saves the resulting session to:
 .secrets/orca_cloud.json
 ```
 
-The file is ignored by git and is written with mode `600`. The Orca Cloud
-session is separate from OrcaSlicer's own session, so signing in here does not
-log OrcaSlicer out.
+The file is ignored by git and is written with mode `600` using `mkstemp`, so
+the refresh token is never briefly readable by other local users. The Orca
+Cloud session is separate from OrcaSlicer's own session, so signing in here does
+not log OrcaSlicer out.
 
 If the browser does not open, copy the printed URL into a browser. Use
 `--provider github` to sign in with GitHub instead of Google.
@@ -76,7 +77,13 @@ automatically.
 
 The API is undocumented and may change. Authentication uses the public
 Supabase client key that ships with OrcaSlicer; no client secret or password is
-stored by this tool. The listing description is limited to 10,000 characters.
+stored by this tool. The listing description is limited to 10,000 characters
+and 10,000 UTF-8 bytes; `update` checks both before sending and reports both
+counts in a dry run. Check the markdown source directly with:
+
+```sh
+python3 plugin/check_hub_description.py plugin/HUB_DESCRIPTION.md
+```
 
 ## Token rotation
 
@@ -87,7 +94,11 @@ same time. If a token is spent or revoked, run `login` again.
 
 ## Security
 
-- Never commit `.secrets/`; it is listed in `.gitignore`.
+- Never commit `.env`, `.env.*` or `.secrets/`; they are listed in `.gitignore`.
+  Rotate any personal access token that was stored in a plaintext `.env` and
+  prefer `gh auth login` or a fine-grained token scoped to this repository.
 - The helper only talks to `api.orcaslicer.com` and `auth.orcaslicer.com`.
 - It does not read OrcaSlicer's keychain item or encrypted token file.
 - It can only manage plugins owned by the signed-in account.
+- The release workflow uses GitHub OIDC, so no repository PAT is needed for
+  publishing. The account session here is only for listing metadata.

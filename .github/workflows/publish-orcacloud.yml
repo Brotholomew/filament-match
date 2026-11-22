@@ -5,16 +5,86 @@ on:
     types: [published]
 
 permissions:
-  id-token: write
   contents: read
+  id-token: write
 
 env:
   # Space-separated globs matching the plugin files to upload (.whl / .py).
   PLUGIN_FILES: "plugin/hub/filament_match_any.py"
 
 jobs:
-  publish:
+  test:
+    name: Test release build
+    if: github.event.release.prerelease == false
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build source-version artifacts
+        run: |
+          python plugin/build_single_file.py
+          python plugin/build_hub_file.py
+
+      - name: Run tests
+        run: python -m unittest discover -s plugin/tests -p "test_*.py" -v
+
+      - name: Build and validate release artifact
+        run: |
+          python plugin/build_hub_file.py --version "${GITHUB_REF_NAME#v}"
+          python plugin/check_artifact.py plugin/hub/filament_match_any.py --version "${GITHUB_REF_NAME#v}"
+        shell: bash
+
+  attach-assets:
+    name: Attach release assets
+    needs: test
+    if: github.event.release.prerelease == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build release artifact
+        run: python plugin/build_hub_file.py --version "${GITHUB_REF_NAME#v}"
+        shell: bash
+
+      - name: Write SHA-256 checksum
+        run: |
+          cd plugin/hub
+          sha256sum filament_match_any.py > filament_match_any.py.sha256
+          cat filament_match_any.py.sha256
+        shell: bash
+
+      - name: Attach artifact and checksum to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release upload "$GITHUB_REF_NAME"
+          plugin/hub/filament_match_any.py
+          plugin/hub/filament_match_any.py.sha256
+          --clobber
+        shell: bash
+
+  publish:
+    name: Publish to OrcaCloud
+    needs:
+      - test
+      - attach-assets
+    if: github.event.release.prerelease == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -23,32 +93,89 @@ jobs:
           python-version: "3.12"
 
       - name: Build hub plugin for this release
-        run: python3 plugin/build_hub_file.py --version "${GITHUB_REF_NAME#v}"
+        run: python plugin/build_hub_file.py --version "${GITHUB_REF_NAME#v}"
+        shell: bash
 
       - name: Publish release to OrcaCloud
+        shell: bash
         run: |
           set -euo pipefail
-          oidc_token="$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=orcacloud" | jq -r .value)"
           version="${GITHUB_REF_NAME#v}"
-          changelog="$(jq -r '.release.body // ""' "$GITHUB_EVENT_PATH" | head -c 4000)"
-          metadata="$(jq -cn --arg version "$version" --arg changelog "$changelog" \
-            '{version: $version} + (if $changelog == "" then {} else {changelog: $changelog} end)')"
-          # --form-string sends the JSON verbatim. curl -F treats ";" and
-          # other characters as form parameters and can truncate the JSON.
-          args=(--form-string "metadata=$metadata")
-          shopt -s nullglob
-          for file in $PLUGIN_FILES; do
-            args+=(-F "files=@$file")
-          done
-          if [ "${#args[@]}" -eq 1 ]; then
-            echo "No plugin files matched: $PLUGIN_FILES" >&2
+          : "${ACTIONS_ID_TOKEN_REQUEST_URL:?GitHub OIDC request URL is missing}"
+          : "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:?GitHub OIDC request token is missing}"
+
+          oidc_file="$(mktemp)"
+          response_file="$(mktemp)"
+          trap 'rm -f "$oidc_file" "$response_file"' EXIT
+
+          oidc_url="${ACTIONS_ID_TOKEN_REQUEST_URL}"
+          case "$oidc_url" in
+            *\?*) oidc_url="${oidc_url}&audience=orcacloud" ;;
+            *) oidc_url="${oidc_url}?audience=orcacloud" ;;
+          esac
+          oidc_status="$(curl -sS --retry 3 --retry-delay 2 -o "$oidc_file" \
+            -w '%{http_code}' \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$oidc_url")"
+          if [ "$oidc_status" != "200" ]; then
+            echo "OIDC token request failed with HTTP $oidc_status" >&2
+            cat "$oidc_file" >&2 || true
             exit 1
           fi
-          status="$(curl -sS -o response.json -w '%{http_code}' \
+          if ! jq -e '.value | type == "string" and length > 0' "$oidc_file" >/dev/null; then
+            echo "OIDC response did not contain a token" >&2
+            cat "$oidc_file" >&2 || true
+            exit 1
+          fi
+          oidc_token="$(jq -r '.value' "$oidc_file")"
+
+          # Truncate by Unicode code point, never inside a UTF-8 sequence.
+          changelog="$(jq -r '.release.body // ""' "$GITHUB_EVENT_PATH" \
+            | python3 -c 'import sys; sys.stdout.write(sys.stdin.read()[:4000])')"
+          metadata="$(jq -cn --arg version "$version" --arg changelog "$changelog" \
+            '{version: $version} + (if $changelog == "" then {} else {changelog: $changelog} end)')"
+
+          # Keep the file list in an array so a glob or a path with spaces is
+          # never split by the shell. --form-string sends the JSON verbatim;
+          # curl -F would treat ";" and other characters as form parameters.
+          IFS=' ' read -r -a plugin_patterns <<< "${PLUGIN_FILES}"
+          plugin_files=()
+          for pattern in "${plugin_patterns[@]}"; do
+            matched=0
+            while IFS= read -r file; do
+              [ -n "$file" ] || continue
+              plugin_files+=("$file")
+              matched=1
+            done < <(compgen -G "$pattern" || true)
+            if [ "$matched" -eq 0 ]; then
+              echo "No plugin files matched: $pattern" >&2
+              exit 1
+            fi
+          done
+          if [ "${#plugin_files[@]}" -eq 0 ]; then
+            echo "No plugin files configured in PLUGIN_FILES: $PLUGIN_FILES" >&2
+            exit 1
+          fi
+
+          args=(--form-string "metadata=$metadata")
+          for file in "${plugin_files[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "Plugin file not found: $file" >&2
+              exit 1
+            fi
+            args+=(-F "files=@$file")
+          done
+
+          status="$(curl -sS -o "$response_file" -w '%{http_code}' \
             -H "Authorization: Bearer $oidc_token" \
             "${args[@]}" \
             https://api.orcaslicer.com/api/v1/plugin-publish/releases)"
-          cat response.json
+          cat "$response_file"
           echo
-          [ "$status" = "201" ]
+          case "$status" in
+            200|201) ;;
+            *)
+              echo "Orca Cloud publish failed with HTTP $status" >&2
+              exit 1
+              ;;
+          esac

@@ -68,8 +68,8 @@ different index in the **Settings** tile.
    run it from **File → Plugins → Filament Match → Run plugin**, from the Speed
    Dial, or with the Speed Dial shortcut.
 
-Orca Cloud plugins are a beta feature. Use a current OrcaSlicer build with
-plugin support; `2.5.2` is the tested version.
+Orca Cloud plugins are a beta feature. Filament Match requires OrcaSlicer
+`2.5.2` or newer.
 
 ### Install from source
 
@@ -81,24 +81,40 @@ cd filament-match
 ./plugin/install.sh
 ```
 
-On Linux, point the installer at your Orca data directory if it is not the
-default:
+The installer detects the default data directory on macOS and Linux. Pass one
+explicitly to install into a clone or non-default location:
 
 ```sh
-./plugin/install.sh "$HOME/.config/OrcaSlicer"
+./plugin/install.sh "$HOME/Library/Application Support/OrcaSlicer"   # macOS
+./plugin/install.sh "$HOME/.config/OrcaSlicer"                       # Linux
 ```
 
-Windows (PowerShell):
+Windows (PowerShell) needs Python 3.12 or newer to build. Installing a prebuilt
+release artifact needs no Python:
 
 ```powershell
 git clone git@github.com:Brotholomew/filament-match.git
 cd filament-match
+python --version
 python plugin\build_single_file.py
-$dest = "$env:APPDATA\OrcaSlicer\orca_plugins\filament_match"
+
+$plugins = Join-Path $env:APPDATA "OrcaSlicer\orca_plugins"
+$dest = Join-Path $plugins "filament_match"
+$legacy = Join-Path $plugins "filament_match.py"
+
+if (Test-Path $legacy) { Remove-Item -Recurse -Force $legacy }
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
-Copy-Item plugin\dist\filament_match.py "$dest\filament_match.py"
-'{"enabled": true}' | Set-Content "$dest\.install_state.json"
+Get-ChildItem $dest -File |
+  Where-Object { ($_.Extension -in ".py", ".whl") -and $_.Name -ne "filament_match.py" } |
+  Remove-Item -Force
+Remove-Item -Recurse -Force (Join-Path $dest "__pycache__") -ErrorAction SilentlyContinue
+Copy-Item plugin\dist\filament_match.py (Join-Path $dest "filament_match.py") -Force
+'{"enabled": true}' | Set-Content -Encoding ascii (Join-Path $dest ".install_state.json")
 ```
+
+Each stable GitHub release also attaches `filament_match_any.py` and a SHA-256 file.
+To install without Python, download both, verify the checksum, and copy the
+artifact into the same folder as `filament_match.py`.
 
 Then restart OrcaSlicer, open **File → Plugins**, enable **Filament Match**, and
 run it. The plugin opens as a docked panel beside the sidebar; drag it, float it,
@@ -344,11 +360,19 @@ named `orca_plugins/filament_match.py/`. Orca loads that folder instead of
 `orca_plugins/filament_match/`. Remove the legacy folder:
 
 ```sh
+# macOS
 rm -rf "$HOME/Library/Application Support/OrcaSlicer/orca_plugins/filament_match.py"
+# Linux
+rm -rf "$HOME/.config/OrcaSlicer/orca_plugins/filament_match.py"
 ```
 
-Current versions of `plugin/install.sh` remove it automatically. Orca must be
-restarted after changing plugin files.
+```powershell
+# Windows
+Remove-Item -Recurse -Force (Join-Path $env:APPDATA "OrcaSlicer\orca_plugins\filament_match.py")
+```
+
+Current versions of `plugin/install.sh` remove it automatically (the Windows
+steps above do the same). Orca must be restarted after changing plugin files.
 
 **A price copy does not appear.** Make sure Orca is restarted after installing
 the plugin. A price copy of a user preset must inherit a system parent; older
@@ -366,6 +390,9 @@ plugin/
   dev/mock_printer.py        # editable mock Snapmaker/Moonraker printer
   build_single_file.py       # flatten to one installable .py
   build_hub_file.py          # generate the Orca Cloud upload artifact
+  check_version.py           # release version consistency check
+  check_hub_description.py   # Hub character/byte limit check
+  check_artifact.py          # validate a built flat/Hub artifact
   dev/orca_hub.py            # read/update the Orca Cloud listing metadata
   dev/ORCA_HUB.md            # one-time sign-in and metadata commands
   install.sh                 # build and install locally
@@ -386,17 +413,31 @@ Build the Orca Cloud artifact:
 ```sh
 python3 plugin/build_hub_file.py
 # or, for a release version:
-python3 plugin/build_hub_file.py --version 0.8.1
+python3 plugin/build_hub_file.py --version <release-version>
 ```
 
 The Hub artifact is written to `plugin/hub/filament_match_any.py`. The `_any`
 suffix tells Orca Cloud the plugin is pure Python and runs on every supported
 operating system.
 
+Check the release version and Hub description limits before publishing:
+
+```sh
+python3 plugin/check_version.py
+python3 plugin/check_hub_description.py plugin/HUB_DESCRIPTION.md
+```
+
+`plugin/filament_match.py` is the single version source: its PEP 723
+`version` and `PLUGIN_VERSION` must agree, and `check_version.py` also checks
+the built artifacts and release-facing docs.
+
 Run the tests:
 
 ```sh
 python3 plugin/build_single_file.py
+python3 plugin/build_hub_file.py
+python3 plugin/check_version.py
+python3 plugin/check_hub_description.py plugin/HUB_DESCRIPTION.md
 python3 -m unittest discover -s plugin/tests -p 'test_*.py' -v
 ```
 
@@ -405,21 +446,31 @@ To test feeder counts and filament combinations without a real printer, see
 
 ## Publishing
 
-Every GitHub release publishes a new Orca Cloud version through OIDC trusted
-publishing. No repository tokens or secrets are stored in the workflow.
+Every stable GitHub release publishes a new Orca Cloud version through OIDC
+trusted publishing. Prereleases are skipped. No repository tokens or secrets
+are stored in the workflow.
 
 - Workflow: [`.github/workflows/publish-orcacloud.yml`](.github/workflows/publish-orcacloud.yml)
 - Artifact: `plugin/hub/filament_match_any.py`
-- Trigger: a published GitHub release
+- Release assets: the artifact and `filament_match_any.py.sha256`
+- Trigger: a published, non-prerelease GitHub release
 - Version: the release tag without the leading `v`
-- Changelog: the GitHub release notes, truncated to Orca Cloud's limit
+- Changelog: the GitHub release notes, truncated by character to Orca Cloud's limit
+- Gate: the test suite runs first; the publish job needs a successful test job
 
 The release tag must be a semantic version higher than the currently published
 plugin version. The workflow builds the artifact with the tag version before
-uploading, so the file header and `PLUGIN_VERSION` always match the release.
+uploading, so the file header and `PLUGIN_VERSION` always match the release. It
+validates the OIDC response before publishing and attaches the SHA-256 checksum
+to the GitHub release.
+
+`plugin/filament_match.py` is the canonical version. After changing it, update
+the Hub listing version and changelog in
+[plugin/HUB_PUBLISHING.md](plugin/HUB_PUBLISHING.md), then run
+`python3 plugin/check_version.py`.
 
 See [plugin/HUB_PUBLISHING.md](plugin/HUB_PUBLISHING.md) for the Hub listing
-fields and the GitHub publishing setup.
+fields, release assets, credentials and the GitHub publishing setup.
 
 GitHub OIDC can publish releases but cannot edit listing metadata. To read or
 update the Hub listing description, tags or visibility, use the account-session
@@ -430,3 +481,16 @@ python3 plugin/dev/orca_hub.py login
 python3 plugin/dev/orca_hub.py show
 python3 plugin/dev/orca_hub.py update --description-file plugin/HUB_DESCRIPTION.md
 ```
+
+### Credentials
+
+- Never commit `.env` or `.secrets/`; both are git-ignored. `.env.example` is
+  the only tracked placeholder.
+- Rotate any personal access token that was stored in a plaintext `.env`,
+  especially an admin-scoped token, then revoke the old token. Prefer
+  `gh auth login` for local work or a fine-grained token limited to this
+  repository.
+- The publish workflow uses GitHub OIDC, not a stored PAT. The Orca Cloud
+  account session is separate and is written with mode `0600`.
+- The Hub description limit is 10,000 characters **and** 10,000 UTF-8 bytes;
+  `python3 plugin/check_hub_description.py` enforces both.
