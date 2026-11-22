@@ -7,7 +7,11 @@ registration checked. This does not test any host call.
 from __future__ import annotations
 
 import importlib.util
+import json
+import shutil
+import subprocess
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -102,6 +106,111 @@ class EntrySmokeTests(unittest.TestCase):
             self.assertEqual(module.FilamentMatch().get_name(), "Filament Match")
         finally:
             sys.modules.pop("orca", None)
+
+    def _entry_module(self):
+        fake = _fake_orca()
+        sys.modules["orca"] = fake
+        spec = importlib.util.spec_from_file_location(
+            "filament_match_ui_helpers", ENTRY)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.addCleanup(sys.modules.pop, "orca", None)
+        return module
+
+    def _run_node(self, source, check=False):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node is not installed")
+        path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                    "w", suffix=".js", delete=False, encoding="utf-8") as stream:
+                stream.write(source)
+                path = stream.name
+            command = [node, "--check", path] if check else [node, path]
+            return subprocess.run(
+                command, capture_output=True, text=True, timeout=30)
+        finally:
+            if path:
+                Path(path).unlink(missing_ok=True)
+
+    def test_page_javascript_parses(self):
+        module = self._entry_module()
+        start = module.PAGE.index("<script>") + len("<script>")
+        end = module.PAGE.index("</script>", start)
+        result = self._run_node(module.PAGE[start:end], check=True)
+        self.assertEqual(
+            result.returncode, 0,
+            "JavaScript syntax error:\n%s\n%s" % (result.stdout, result.stderr))
+
+    def test_ui_state_helpers(self):
+        module = self._entry_module()
+        start = module.PAGE.index("// #region FM_STATE_HELPERS")
+        end = module.PAGE.index("// #endregion FM_STATE_HELPERS", start)
+        helpers = module.PAGE[start:end]
+        assertions = r"""
+const assert = require('assert');
+const ambiguous = {choose: true, selected: '', dirty: true, slot_exists: true,
+  candidates: [{preset_name: 'A'}, {preset_name: 'B'}]};
+assert.strictEqual(fmSelectedValue(ambiguous), '');
+assert.strictEqual(fmRowApplyable(ambiguous), false);
+assert.strictEqual(fmApplyCount([ambiguous]), 0);
+assert.strictEqual(fmStatusFor(ambiguous).kind, 'warn');
+assert.ok(fmStatusFor(ambiguous).text.includes('pick'));
+const library = {preset_name: '', source: 'library',
+  candidates: [{preset_name: 'CC3D PETG (OFD)', source: 'library'}]};
+assert.strictEqual(fmSelectedValue(library), 'lib:CC3D PETG (OFD)');
+assert.ok(fmRowApplyable({...library, selected: 'lib:CC3D PETG (OFD)',
+  preset_name: 'CC3D PETG (OFD)', source: 'library', dirty: true}));
+assert.strictEqual(fmIsApplied({current_name: '_local/filament_match/X',
+  preset_name: '_local/filament_match/X'}), true);
+assert.strictEqual(fmIsApplied({current: 'eSUN PETG',
+  preset_name: 'eSUN PETG @U1'}), true);
+assert.strictEqual(fmIsApplied({current: 'Other', preset_name: 'eSUN PETG'}), false);
+assert.strictEqual(fmRowDirty({selected: 'X', preset_name: 'X',
+  current_name: 'X'}), false);
+assert.strictEqual(fmRowDirty({selected: 'X', preset_name: 'X',
+  current_name: 'Y'}), true);
+assert.strictEqual(fmStatusFor({selected: 'X', preset_name: 'X',
+  current_name: 'X'}).text, 'Already in slot');
+assert.strictEqual(fmStatusFor({selected: 'X', preset_name: 'X',
+  current_name: 'Y', source: 'installed', dirty: true}).kind, 'warn');
+assert.strictEqual(fmStatusFor({selected: 'lib:X', preset_name: 'X',
+  source: 'library', dirty: true}).kind, 'warn');
+assert.notStrictEqual(
+  fmPriceStageKey({identity: 'spool:1', selected: 'A'}),
+  fmPriceStageKey({identity: 'spool:1', selected: 'B'}));
+assert.notStrictEqual(
+  fmPriceStageKey({identity: 'spool:1', selected: 'A'}),
+  fmPriceStageKey({identity: 'spool:2', selected: 'A'}));
+const failed = {selected: 'X', preset_name: 'X', current_name: 'Y',
+  price_pending: true, pending: true};
+fmApplyErrorState(failed);
+assert.strictEqual(failed.price_pending, false);
+assert.strictEqual(failed.pending, false);
+assert.strictEqual(failed.dirty, true);
+console.log('ok');
+"""
+        result = self._run_node(helpers + "\n" + assertions)
+        self.assertEqual(
+            result.returncode, 0,
+            "UI helper test failed:\n%s\n%s" % (result.stdout, result.stderr))
+
+    def test_missing_ui_actions_are_wired(self):
+        module = self._entry_module()
+        page = module.PAGE
+        self.assertIn('id="refreshPresets"', page)
+        self.assertIn("post('refresh')", page)
+        self.assertIn("row.ignored ? 'unmute' : 'mute'", page)
+        self.assertIn("row.ignored ? 'Unmute' : 'Mute'", page)
+        self.assertIn("post(mute ? 'mute' : 'unmute'", page)
+        self.assertIn("feeders_known: state.feedersKnown", page)
+        self.assertIn("fmPriceStageKey", page)
+        self.assertIn("fmApplyErrorState", page)
+        self.assertIn("const value = 'lib:' + cand.preset_name;", page)
+        self.assertIn("esc(value)", page)
+        self.assertNotIn("first.checked = true", page)
+        self.assertIn("already open", page)
 
     def test_flat_build_has_no_duplicate_globals(self):
         script = PLUGIN_DIR / "build_single_file.py"
