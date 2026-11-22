@@ -16,9 +16,12 @@ Matching order (see PLAN.md):
 7. an error string when nothing matches.
 
 Identity keys are ``spool:<id>``, ``tag:<normalized uid>`` or
-``filament:<sha1(vendor|material|subtype|product|color)>``. History stores
-those under the ``spools`` / ``tags`` / ``filaments`` sections with a
-``default`` and per-printer names, and writes atomically.
+``filament:<sha1(vendor|material|subtype|product|color)>``. Normalization is
+Unicode-safe (NFKD, combining marks removed, trademark marks dropped), so
+non-ASCII vendors cannot collapse into one empty identity. History schema
+version 2 stores those keys under the ``spools`` / ``tags`` / ``filaments``
+sections with a ``default`` and per-printer names, writes atomically, and
+reads pre-fix keys as a legacy fallback without writing them again.
 
 Assumptions/extensions worth knowing at the call site:
 
@@ -66,6 +69,7 @@ __all__ = [
     "normalize_text",
     "normalize_vendor",
     "normalize_material",
+    "material_family",
     "normalize_color",
     "normalize_tag_uid",
     "strip_printer_suffix",
@@ -200,6 +204,12 @@ _HEX_RE = re.compile(r"^[0-9a-f]+$")
 _LOCAL_SUFFIX_RE = re.compile(
     r"\s*\((?:local|custom|ofd|copy)\)\s*$", re.I)
 _HISTORY_SECTIONS = ("spools", "tags", "filaments")
+_HISTORY_VERSION = 2
+_TRADEMARK_MARKS = str.maketrans("", "", "\u2122\u00ae\u00a9")
+_TAG_PLACEHOLDERS = frozenset({"", "0", "NA", "NONE", "NULL", "UNKNOWN"})
+_GENERIC_VARIANT_TOKENS = frozenset(
+    {"cf", "gf", "silk", "matte", "hf", "snapspeed", "basic"}
+)
 
 
 def _core_text(value: Any) -> str:
@@ -222,12 +232,49 @@ def strip_local_suffix(value: Any) -> str:
 
 
 def normalize_text(value: Any) -> str:
-    """Casefold, expand ``+``/``&``, strip punctuation and collapse spaces."""
-    text = unicodedata.normalize("NFKC", _core_text(value))
+    """Unicode-safe casefold/normalization for vendors, materials and names.
+
+    NFKD decomposition plus combining-mark removal makes accented Latin,
+    Greek and Cyrillic names comparable, while Unicode letters/numbers are
+    retained (CJK included). Trademark marks are removed instead of becoming
+    a fake ``tm`` token. ``+``/``&`` keep their historical expansion so the
+    existing identity format and product matching stay stable.
+    """
+    text = _core_text(value).translate(_TRADEMARK_MARKS)
     text = text.replace("+", " plus ").replace("&", " and ")
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(
+        character for character in text
+        if not unicodedata.combining(character)
+    )
     text = text.casefold()
-    text = re.sub(r"[^0-9a-z]+", " ", text)
+    text = "".join(
+        character if (character.isalnum() or character.isspace()) else " "
+        for character in text
+    )
     return " ".join(text.split())
+
+
+def _canonical_material_words(text: str) -> str:
+    """Canonicalize material families after :func:`normalize_text`."""
+    text = re.sub(r"\bpet\s+g\b", "petg", text)
+    text = re.sub(r"\bpla\s+plus\b", "pla", text)
+    text = re.sub(r"\bnylon\b", "pa", text)
+    return text
+
+
+def _identity_text(value: Any, normalizer) -> str:
+    """Normalized identity component, retaining raw value if it normalizes empty."""
+    normalized = normalizer(value)
+    if normalized:
+        return normalized
+    raw = _core_text(value).strip().casefold()
+    return f"raw:{raw}" if raw else ""
+
+
+def _vendor_token(value: Any) -> str:
+    """Vendor comparison token that cannot silently become empty."""
+    return _identity_text(value, normalize_vendor)
 
 
 def strip_printer_suffix(value: Any) -> str:
@@ -245,9 +292,11 @@ def strip_bundle_prefix(value: Any) -> str:
     """
     text = _core_text(value).strip()
     text = re.sub(r"^_(?:local|subscribed)/[^/]+/", "", text, flags=re.I)
-    text = re.sub(r"^\s*\[[^\]]*\]\s*", "", text)
-    text = re.sub(r"^\s*\([^)]*\)\s*", "", text)
-    text = re.sub(r"^(?:bundle|local|user|system)\s*[:\-]\s*", "", text, flags=re.I)
+    # Only known provenance markers may be removed. A leading parenthetical
+    # or bracket is part of the product name ("(Matte) eSUN PETG") unless it
+    # is the OFD marker.
+    text = re.sub(r"^\s*\[OFD\]\s*", "", text, flags=re.I)
+    text = re.sub(r"^(?:bundle|local|user|system)\s*:\s*", "", text, flags=re.I)
     return text.strip()
 
 
@@ -256,13 +305,92 @@ def normalize_vendor(value: Any) -> str:
 
 
 def normalize_material(value: Any) -> str:
-    text = normalize_text(value)
-    # Common spelling variant in printer payloads and preset names.
-    return re.sub(r"\bpet\s+g\b", "petg", text)
+    """Canonical material family + optional variant/hardness.
+
+    ``PLA+``/``PLA Plus`` collapse to ``PLA``; ``PET-G`` to ``PETG``;
+    ``Nylon`` to ``PA``; ``PLA-CF`` becomes ``pla cf`` and ``TPU-95A``
+    becomes ``tpu 95a`` so the family and detail stay usable for exact
+    matching, generic lookup and identity.
+    """
+    return _canonical_material_words(normalize_text(value))
+
+
+def material_family(value: Any) -> str:
+    """The base material family: ``pla cf`` → ``pla``, ``tpu 95a`` → ``tpu``."""
+    material = normalize_material(value)
+    return material.split(" ", 1)[0] if material else ""
+
+
+def _is_material_variant_token(token: str) -> bool:
+    """CF/GF and hardness tokens that must be confirmed by evidence."""
+    return token in {"cf", "gf"} or bool(
+        re.fullmatch(r"\d{2,3}[ad]", token)
+    )
+
+
+def _material_variant_tokens_from_text(value: Any) -> set[str]:
+    return {
+        token for token in normalize_text(value).split()
+        if _is_material_variant_token(token)
+    }
+
+
+def _material_variant_tokens_from_material(value: Any) -> set[str]:
+    parts = normalize_material(value).split()
+    return {
+        token for token in parts[1:]
+        if _is_material_variant_token(token)
+    }
+
+
+def _observation_variant_tokens(obs: Observation) -> set[str]:
+    tokens = _material_variant_tokens_from_material(
+        getattr(obs, "material", "")
+    )
+    tokens.update(_material_variant_tokens_from_text(
+        getattr(obs, "subtype", "")
+    ))
+    tokens.update(_material_variant_tokens_from_text(
+        getattr(obs, "product", "")
+    ))
+    return tokens
+
+
+def _preset_variant_tokens(preset: Any) -> set[str]:
+    tokens = _material_variant_tokens_from_material(
+        getattr(preset, "material", "")
+    )
+    tokens.update(_material_variant_tokens_from_text(
+        getattr(preset, "subtype", "")
+    ))
+    tokens.update(_material_variant_tokens_from_text(
+        _name_without_vendor_material(preset)
+    ))
+    return tokens
+
+
+def _material_variants_match(obs: Observation, preset: Any) -> bool:
+    """CF/GF/hardness evidence must agree in both directions."""
+    return _observation_variant_tokens(obs) == _preset_variant_tokens(preset)
 
 
 def _parse_hex_color(value: Any) -> tuple[int, int, int] | None:
-    text = _core_text(value).strip().lower()
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        if 0 <= value <= 0xFFFFFF:
+            return (value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF
+        if 0 <= value <= 0xFFFFFFFF:
+            # Klipper/Snapmaker call the field RGBA, so alpha is last.
+            return (
+                (value >> 24) & 0xFF,
+                (value >> 16) & 0xFF,
+                (value >> 8) & 0xFF,
+            )
+        return None
+
+    raw_text = _core_text(value).strip()
+    text = raw_text.lower()
     prefixed = False
     if text.startswith("#"):
         text = text[1:]
@@ -271,6 +399,16 @@ def _parse_hex_color(value: Any) -> tuple[int, int, int] | None:
         text = text[2:]
         prefixed = True
     if not text or not _HEX_RE.match(text):
+        return None
+    # A bare lowercase six/eight-letter token such as "facade" is a word, not
+    # a colour. Uppercase forms and forms containing digits remain accepted
+    # because printers emit raw RRGGBB/RRGGBBAA without a prefix.
+    if (
+        not prefixed
+        and len(text) in (6, 8)
+        and text.isalpha()
+        and raw_text.islower()
+    ):
         return None
     if len(text) in (3, 4):  # #RGB / #RGBA
         if not prefixed:  # bare "bad" is a name, not shorthand hex
@@ -292,8 +430,20 @@ def normalize_color(value: Any) -> str:
 
 
 def normalize_tag_uid(value: Any) -> str:
-    """Normalize RFID UIDs: uppercase, separators removed."""
-    return re.sub(r"[^0-9A-Za-z]", "", _core_text(value)).upper()
+    """Normalize RFID UIDs: uppercase, separators removed.
+
+    All-zero values and the usual sentinel strings (Orca uses
+    ``0000000000000000`` when a tray has no tag) are not identities. All-F
+    values of realistic UID length are also treated as placeholders.
+    """
+    text = re.sub(r"[^0-9A-Za-z]", "", _core_text(value)).upper()
+    if not text or text in _TAG_PLACEHOLDERS:
+        return ""
+    if set(text) == {"0"}:
+        return ""
+    if len(text) >= 8 and set(text) == {"F"}:
+        return ""
+    return text
 
 
 def strip_color_words(value: Any) -> str:
@@ -329,7 +479,9 @@ def _preset_name(preset: Any) -> str:
     name = getattr(preset, "name", "")
     if isinstance(name, str):
         return name.strip()
-    return _core_text(preset).strip()
+    # Never persist ``repr(preset)`` for a malformed/unrecognised object.
+    # An empty name makes remember() fail loudly instead of writing garbage.
+    return ""
 
 
 def _preset_rank(preset: Any) -> int:
@@ -381,8 +533,13 @@ def _preset_product_texts(preset: Any) -> list[str]:
 def _normalized_product(value: Any) -> str:
     raw = normalize_text(value)
     stripped = strip_color_words(value)
-    # A product that is only a colour word ("Black") must still be comparable.
-    return stripped or raw
+    result = stripped or raw
+    if result:
+        return result
+    # Non-empty text that normalization drops (e.g. only trademark marks)
+    # must stay comparable instead of becoming "unknown".
+    text = _core_text(value).strip().casefold()
+    return f"raw:{text}" if text else ""
 
 
 _PRODUCT_QUALIFIERS = frozenset(
@@ -403,15 +560,21 @@ _PRODUCT_QUALIFIERS = frozenset(
 def _observed_product_text(obs: Observation) -> str:
     """The product text that may constrain a match.
 
-    Spoolman's filament name is often just a colour ("Yellow"), a colour plus
-    the material ("PETG Pink"), or the material plus a grade word ("PETG
-    Basic"). None of those identify a product line, so they must not prevent
-    an exact vendor/material preset match. A name with an actual extra token
-    ("ABS Pastel", "PETG Matte") still constrains it.
+    Spoolman's filament name is often only a colour ("White", "Yellow"), a
+    colour plus the material ("PETG Pink"), or the material plus a grade word
+    ("PLA Basic"). None of those identify a product line, so vendor and
+    material tokens are removed alongside colour words and grade qualifiers.
+    A name with an actual extra token ("ABS Pastel", "PETG Matte") still
+    constrains it. Policy: ``PLA Basic`` is a grade label, not a product line;
+    a reported subtype Basic is still enforced by the subtype check.
     """
     raw = getattr(obs, "product", "")
     text = strip_color_words(raw)
     if not text:
+        # A non-empty product that normalizes to nothing must still constrain
+        # the history check rather than silently becoming "unknown".
+        if _core_text(raw).strip() and not normalize_text(raw):
+            return _core_text(raw).strip().casefold()
         return ""
     subtype_tokens = set(normalize_text(getattr(obs, "subtype", "")).split())
     tokens = [
@@ -420,7 +583,24 @@ def _observed_product_text(obs: Observation) -> str:
     ]
     if not tokens:
         return ""
+    # If nothing remains after removing the vendor/material/grade tokens, the
+    # name was only a colour or material label and must not constrain a match.
+    metadata_tokens: set[str] = set()
+    metadata_tokens.update(
+        normalize_material(getattr(obs, "material", "")).split()
+    )
+    metadata_tokens.update(normalize_text(getattr(obs, "material", "")).split())
+    metadata_tokens.update(
+        normalize_vendor(getattr(obs, "vendor", "")).split()
+    )
+    if not any(token not in metadata_tokens for token in tokens):
+        return ""
     return " ".join(tokens)
+
+
+def _is_color_only_product(value: Any) -> bool:
+    tokens = normalize_text(value).split()
+    return bool(tokens) and all(token in _COLOR_WORDS for token in tokens)
 
 
 def _products_match(observed: Any, preset: Any) -> bool:
@@ -460,11 +640,47 @@ def _product_similarity(obs: Observation, preset: Any) -> float:
     return best
 
 
+def _generic_name_text(preset: Any) -> str:
+    """Normalized preset name with material spelling aliases applied."""
+    return _canonical_material_words(normalize_text(
+        strip_printer_suffix(strip_bundle_prefix(getattr(preset, "name", "")))
+    ))
+
+
 def _is_generic(preset: Any) -> bool:
-    name = normalize_text(strip_printer_suffix(strip_bundle_prefix(getattr(preset, "name", ""))))
+    name = _generic_name_text(preset)
     if name == "generic" or name.startswith("generic "):
         return True
     return normalize_vendor(getattr(preset, "vendor", "")) == "generic"
+
+
+def _generic_residual_tokens(name: str, material: str) -> list[str]:
+    """Tokens left after removing ``generic`` and observed material tokens."""
+    tokens = name.split()
+    if tokens and tokens[0] == "generic":
+        tokens = tokens[1:]
+    remaining = list(tokens)
+    for material_token in material.split():
+        if material_token in remaining:
+            remaining.remove(material_token)
+    return remaining
+
+
+def _generic_variant_supported(obs: Observation, residual: Iterable[str]) -> bool:
+    """Whether the observation explicitly supports generic variant tokens."""
+    evidence = " ".join(
+        part for part in (
+            normalize_text(getattr(obs, "subtype", "")),
+            normalize_text(getattr(obs, "product", "")),
+            normalize_text(getattr(obs, "material", "")),
+            normalize_material(getattr(obs, "material", "")),
+        ) if part
+    )
+    evidence_tokens = set(evidence.split())
+    return all(
+        token not in _GENERIC_VARIANT_TOKENS or token in evidence_tokens
+        for token in residual
+    )
 
 
 def _name_prefix_score(obs: Observation, preset: Any) -> int:
@@ -474,7 +690,7 @@ def _name_prefix_score(obs: Observation, preset: Any) -> int:
     if not name:
         return 0
     candidates = (
-        normalize_vendor(getattr(obs, "vendor", "")),
+        _vendor_token(getattr(obs, "vendor", "")),
         _normalized_product(getattr(obs, "product", "")),
         normalize_material(getattr(obs, "material", "")),
     )
@@ -511,6 +727,12 @@ def _subtype_match(obs: Observation, preset: Any) -> tuple[int, str]:
     if not observed:
         return 0, ""
     configured = normalize_text(getattr(preset, "subtype", ""))
+    if not configured:
+        # Sources normally split base material and subtype, but some presets
+        # store the variant in the material field ("PLA-CF", "TPU-95A").
+        configured = " ".join(
+            normalize_material(getattr(preset, "material", "")).split()[1:]
+        )
     if configured and observed == configured:
         return 2, f"subtype {_core_text(getattr(obs, 'subtype', '')).strip()}"
 
@@ -538,14 +760,18 @@ def score_preset(obs: Observation, preset: PresetInfo) -> tuple[int, list[str]]:
     score = 0
     reasons: list[str] = []
 
-    observed_material = normalize_material(getattr(obs, "material", ""))
-    preset_material = normalize_material(getattr(preset, "material", ""))
-    if observed_material and observed_material == preset_material:
+    observed_family = material_family(getattr(obs, "material", ""))
+    preset_family = material_family(getattr(preset, "material", ""))
+    if observed_family and preset_family and observed_family != preset_family:
+        # Material family mismatch is a veto, not a reduced score. Variants
+        # such as CF/GF/hardness are constrained by subtype/name checks.
+        return 0, []
+    if observed_family and observed_family == preset_family:
         score += 30
         reasons.append(f"material {_core_text(getattr(obs, 'material', '')).strip()}")
 
-    observed_vendor = normalize_vendor(getattr(obs, "vendor", ""))
-    preset_vendor = normalize_vendor(getattr(preset, "vendor", ""))
+    observed_vendor = _vendor_token(getattr(obs, "vendor", ""))
+    preset_vendor = _vendor_token(getattr(preset, "vendor", ""))
     if observed_vendor and preset_vendor:
         if observed_vendor == preset_vendor:
             score += 20
@@ -592,6 +818,24 @@ def score_preset(obs: Observation, preset: PresetInfo) -> tuple[int, list[str]]:
 # ---------------------------------------------------------------------------
 
 
+def _filament_identity_key(obs: Observation) -> str:
+    """Fingerprint identity, independent of any spool/tag identifiers."""
+    color = normalize_color(getattr(obs, "color", ""))
+    if not color:
+        color = normalize_text(getattr(obs, "color", "")).replace(" ", "")
+    payload = "|".join(
+        (
+            _identity_text(getattr(obs, "vendor", ""), normalize_vendor),
+            _identity_text(getattr(obs, "material", ""), normalize_material),
+            _identity_text(getattr(obs, "subtype", ""), normalize_text),
+            _identity_text(getattr(obs, "product", ""), normalize_text),
+            color.lstrip("#"),
+        )
+    )
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()
+    return f"filament:{digest}"
+
+
 def identity_key(obs: Observation) -> str:
     """Return the stable identity used by history, in the documented order."""
     spool_id = getattr(obs, "spool_id", None)
@@ -602,20 +846,90 @@ def identity_key(obs: Observation) -> str:
     if tag:
         return f"tag:{tag}"
 
+    return _filament_identity_key(obs)
+
+
+def _identity_keys(obs: Observation) -> list[str]:
+    """All history identities for an observation, highest priority first."""
+    keys: list[str] = []
+    spool_id = getattr(obs, "spool_id", None)
+    if spool_id is not None and _core_text(spool_id).strip():
+        keys.append(f"spool:{_core_text(spool_id).strip()}")
+    tag = normalize_tag_uid(getattr(obs, "tag_uid", ""))
+    if tag:
+        keys.append(f"tag:{tag}")
+    filament = _filament_identity_key(obs)
+    if filament not in keys:
+        keys.append(filament)
+    return keys
+
+
+def _legacy_normalize_text(value: Any) -> str:
+    """The pre-Unicode-fix normalization, used only for old history keys."""
+    text = unicodedata.normalize("NFKC", _core_text(value))
+    text = text.replace("+", " plus ").replace("&", " and ")
+    text = text.casefold()
+    text = re.sub(r"[^0-9a-z]+", " ", text)
+    return " ".join(text.split())
+
+
+def _legacy_strip_bundle_prefix(value: Any) -> str:
+    text = _core_text(value).strip()
+    text = re.sub(r"^_(?:local|subscribed)/[^/]+/", "", text, flags=re.I)
+    text = re.sub(r"^\s*\[[^\]]*\]\s*", "", text)
+    text = re.sub(r"^\s*\([^)]*\)\s*", "", text)
+    text = re.sub(r"^(?:bundle|local|user|system)\s*[:\-]\s*", "", text, flags=re.I)
+    return text.strip()
+
+
+def _legacy_normalize_vendor(value: Any) -> str:
+    return _legacy_normalize_text(_legacy_strip_bundle_prefix(value))
+
+
+def _legacy_normalize_material(value: Any) -> str:
+    text = _legacy_normalize_text(value)
+    return re.sub(r"\bpet\s+g\b", "petg", text)
+
+
+def _legacy_filament_key(obs: Observation) -> str:
+    """The filament fingerprint an older plugin version wrote."""
     color = normalize_color(getattr(obs, "color", ""))
     if not color:
-        color = normalize_text(getattr(obs, "color", "")).replace(" ", "")
+        color = _legacy_normalize_text(
+            getattr(obs, "color", "")
+        ).replace(" ", "")
     payload = "|".join(
         (
-            normalize_vendor(getattr(obs, "vendor", "")),
-            normalize_material(getattr(obs, "material", "")),
-            normalize_text(getattr(obs, "subtype", "")),
-            normalize_text(getattr(obs, "product", "")),
+            _legacy_normalize_vendor(getattr(obs, "vendor", "")),
+            _legacy_normalize_material(getattr(obs, "material", "")),
+            _legacy_normalize_text(getattr(obs, "subtype", "")),
+            _legacy_normalize_text(getattr(obs, "product", "")),
             color.lstrip("#"),
         )
     )
     digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()
     return f"filament:{digest}"
+
+
+def _legacy_identity_key(obs: Observation) -> str:
+    """Compute the key an older plugin version wrote for this observation."""
+    spool_id = getattr(obs, "spool_id", None)
+    if spool_id is not None and _core_text(spool_id).strip():
+        return f"spool:{_core_text(spool_id).strip()}"
+    # Keep the placeholder rejection: an all-zero old tag entry must not
+    # reappear as a real identity.
+    legacy_tag = normalize_tag_uid(getattr(obs, "tag_uid", ""))
+    if legacy_tag:
+        return f"tag:{legacy_tag}"
+    return _legacy_filament_key(obs)
+
+
+def _history_keys(obs: Observation) -> list[str]:
+    keys = _identity_keys(obs)
+    legacy = _legacy_filament_key(obs)
+    if legacy not in keys:
+        keys.append(legacy)
+    return keys
 
 
 def _split_identity(key: str) -> tuple[str, str]:
@@ -628,21 +942,33 @@ def _split_identity(key: str) -> tuple[str, str]:
     return "filaments", key
 
 
-def _entry_name(entry: Any, printer: str) -> str:
+def _entry_names(entry: Any, printer: str) -> list[str]:
+    """Printer-specific name first, then the entry's default; deduplicated."""
+    names: list[str] = []
     if isinstance(entry, str):
-        return entry.strip()
-    if not isinstance(entry, Mapping):
-        return ""
-    if printer:
-        printers = entry.get("printers")
-        if isinstance(printers, Mapping):
-            value = printers.get(printer)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    default = entry.get("default")
-    if isinstance(default, str):
-        return default.strip()
-    return ""
+        value = entry.strip()
+        if value:
+            names.append(value)
+    elif isinstance(entry, Mapping):
+        if printer:
+            printers = entry.get("printers")
+            if isinstance(printers, Mapping):
+                value = printers.get(printer)
+                if isinstance(value, str) and value.strip():
+                    names.append(value.strip())
+        default = entry.get("default")
+        if isinstance(default, str) and default.strip():
+            names.append(default.strip())
+    result: list[str] = []
+    for name in names:
+        if name not in result:
+            result.append(name)
+    return result
+
+
+def _entry_name(entry: Any, printer: str) -> str:
+    names = _entry_names(entry, printer)
+    return names[0] if names else ""
 
 
 class HistoryStore:
@@ -667,11 +993,12 @@ class HistoryStore:
 
     def _load(self) -> None:
         try:
-            with open(os.fspath(self.path), "r", encoding="utf-8") as stream:
+            # utf-8-sig accepts a BOM and is identical to utf-8 otherwise.
+            with open(os.fspath(self.path), "r", encoding="utf-8-sig") as stream:
                 text = stream.read()
         except FileNotFoundError:
             return
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:
             self.load_error = f"{type(exc).__name__}: {exc}"
             return
         try:
@@ -689,16 +1016,45 @@ class HistoryStore:
         data.setdefault("version", 1)
         self._data = data
 
-    def get(self, obs: Observation | str, printer: str = "") -> str:
-        """Return the printer-specific mapping, else the default (or ``""``)."""
-        key = obs if isinstance(obs, str) else identity_key(obs)
-        section, part = _split_identity(key)
+    def _names_for_keys(self, keys: Iterable[str], printer: str) -> list[str]:
+        names: list[str] = []
         printer_name = _core_text(printer).strip()
-        with self._lock:
+        for key in keys:
+            section, part = _split_identity(key)
             section_map = self._data.get(section)
             if not isinstance(section_map, Mapping):
-                return ""
-            return _entry_name(section_map.get(part), printer_name)
+                continue
+            for name in _entry_names(section_map.get(part), printer_name):
+                if name not in names:
+                    names.append(name)
+        return names
+
+    def get(self, obs: Observation | str, printer: str = "") -> str:
+        """Return the printer-specific mapping, else the default (or ``""``).
+
+        A miss on the current Unicode-safe identity falls back to the key the
+        pre-0.9 plugin wrote. New entries are always written under the new key.
+        """
+        key = obs if isinstance(obs, str) else identity_key(obs)
+        keys = [key]
+        if not isinstance(obs, str):
+            legacy = _legacy_identity_key(obs)
+            if legacy != key:
+                keys.append(legacy)
+        with self._lock:
+            names = self._names_for_keys(keys, printer)
+        return names[0] if names else ""
+
+    def lookup(self, obs: Observation, printer: str = "") -> list[str]:
+        """All matching history names for an observation, in priority order.
+
+        Cascade spool → tag → filament, then the legacy filament key. Within
+        one identity the printer-specific entry comes before its default so a
+        stale printer-specific preset can fall back to a valid default.
+        """
+        printer_name = _core_text(printer).strip()
+        with self._lock:
+            return self._names_for_keys(_history_keys(obs), printer_name)
 
     def remember(
         self,
@@ -716,6 +1072,7 @@ class HistoryStore:
 
         with self._lock:
             new_data = copy.deepcopy(self._data)
+            new_data["version"] = _HISTORY_VERSION
             section_map = new_data.setdefault(section, {})
             if not isinstance(section_map, dict):
                 section_map = {}
@@ -733,20 +1090,32 @@ class HistoryStore:
 
             self._write(new_data)
             self._data = new_data
+            self.load_error = ""
         return key
 
     def forget(self, obs: Observation | str) -> bool:
         """Remove one identity entirely. Returns whether anything was deleted."""
         key = obs if isinstance(obs, str) else identity_key(obs)
-        section, part = _split_identity(key)
+        keys = [key]
+        if not isinstance(obs, str):
+            legacy = _legacy_identity_key(obs)
+            if legacy != key:
+                keys.append(legacy)
         with self._lock:
             new_data = copy.deepcopy(self._data)
-            section_map = new_data.get(section)
-            if not isinstance(section_map, dict) or part not in section_map:
+            removed = False
+            for candidate in keys:
+                section, part = _split_identity(candidate)
+                section_map = new_data.get(section)
+                if isinstance(section_map, dict) and part in section_map:
+                    del section_map[part]
+                    removed = True
+            if not removed:
                 return False
-            del section_map[part]
+            new_data["version"] = _HISTORY_VERSION
             self._write(new_data)
             self._data = new_data
+            self.load_error = ""
         return True
 
     def clear(self) -> None:
@@ -755,6 +1124,7 @@ class HistoryStore:
             new_data = _empty_history()
             self._write(new_data)
             self._data = new_data
+            self.load_error = ""
 
     def _write(self, data: Mapping[str, Any]) -> None:
         parent = self.path.parent
@@ -791,31 +1161,46 @@ class HistoryStore:
 
 
 def _empty_history() -> dict[str, Any]:
-    return {"version": 1, "spools": {}, "tags": {}, "filaments": {}}
+    return {"version": _HISTORY_VERSION, "spools": {}, "tags": {}, "filaments": {}}
 
 
-def _lookup_history(history: Any, obs: Observation, printer: str) -> str:
+def _history_names(history: Any, obs: Observation, printer: str) -> list[str]:
+    """Ordered history names: spool → tag → filament, printer then default."""
     if history is None:
-        return ""
+        return []
     if isinstance(history, HistoryStore):
-        return history.get(obs, printer)
+        lookup = getattr(history, "lookup", None)
+        if callable(lookup):
+            return lookup(obs, printer)
+        value = history.get(obs, printer)
+        return [value] if value else []
     if isinstance(history, Mapping):
-        key = identity_key(obs)
-        section, part = _split_identity(key)
-        section_map = history.get(section)
-        if isinstance(section_map, Mapping):
-            name = _entry_name(section_map.get(part), printer)
-            if name:
-                return name
-        return _entry_name(history.get(key), printer)
+        names: list[str] = []
+        for key in _history_keys(obs):
+            section, part = _split_identity(key)
+            section_map = history.get(section)
+            if isinstance(section_map, Mapping):
+                for name in _entry_names(section_map.get(part), printer):
+                    if name not in names:
+                        names.append(name)
+            direct = history.get(key)
+            for name in _entry_names(direct, printer):
+                if name not in names:
+                    names.append(name)
+        return names
     getter = getattr(history, "get", None)
     if callable(getter):
         try:
             value = getter(obs, printer)
         except TypeError:
             value = getter(obs)
-        return value.strip() if isinstance(value, str) else ""
-    return ""
+        return [value.strip()] if isinstance(value, str) and value.strip() else []
+    return []
+
+
+def _lookup_history(history: Any, obs: Observation, printer: str) -> str:
+    names = _history_names(history, obs, printer)
+    return names[0] if names else ""
 
 
 # ---------------------------------------------------------------------------
@@ -823,8 +1208,77 @@ def _lookup_history(history: Any, obs: Observation, printer: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _as_bool(value: Any) -> bool:
+    """Boolean coercion that treats ``"false"``/``"0"`` as false."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().casefold() not in {
+            "", "0", "false", "no", "off", "none", "null",
+        }
+    return bool(value)
+
+
 def _compatible(presets: Iterable[PresetInfo]) -> list[PresetInfo]:
-    return [preset for preset in presets if bool(getattr(preset, "compatible", False))]
+    return [
+        preset for preset in presets
+        if _as_bool(getattr(preset, "compatible", False))
+    ]
+
+
+def _dedupe_presets(presets: Iterable[PresetInfo]) -> list[PresetInfo]:
+    """Drop presets that are indistinguishable (name, bundle and file)."""
+    result: list[PresetInfo] = []
+    seen: set[tuple[str, str, str]] = set()
+    for preset in presets:
+        name = _core_text(getattr(preset, "name", "")).strip()
+        key = (
+            name,
+            _core_text(getattr(preset, "bundle_id", "")).strip(),
+            _core_text(getattr(preset, "file", "")).strip(),
+        )
+        if name and key in seen:
+            continue
+        if name:
+            seen.add(key)
+        result.append(preset)
+    return result
+
+
+def _vendor_matches(obs: Observation, preset: Any) -> bool:
+    observed = _vendor_token(getattr(obs, "vendor", ""))
+    if not observed:
+        return True
+    preset_vendor = _vendor_token(getattr(preset, "vendor", ""))
+    if preset_vendor:
+        return observed == preset_vendor
+    # A preset with no vendor config may still carry the brand in its name.
+    name_tokens = normalize_text(
+        strip_printer_suffix(strip_bundle_prefix(getattr(preset, "name", "")))
+    ).split()
+    wanted = observed.split()
+    return bool(wanted) and name_tokens[: len(wanted)] == wanted
+
+
+def _material_matches(obs: Observation, preset: Any) -> bool:
+    observed_family = material_family(getattr(obs, "material", ""))
+    if not observed_family:
+        return True
+    preset_family = material_family(getattr(preset, "material", ""))
+    if not preset_family:
+        return True
+    if observed_family != preset_family:
+        return False
+    return _material_variants_match(obs, preset)
+
+
+def _colour_veto(obs: Observation, preset: Any) -> bool:
+    distance = color_distance(
+        getattr(obs, "color", ""), getattr(preset, "color", "")
+    )
+    return distance is not None and distance > 100
 
 
 def _is_price_copy(preset: Any) -> bool:
@@ -897,15 +1351,24 @@ def _multi_result(
     matches: list[PresetInfo],
     source: str,
     confidence: int,
-    reasons_by_preset: Mapping[str, list[str]] | None = None,
-    score_by_preset: Mapping[str, int] | None = None,
+    reasons_by_preset: Mapping[Any, list[str]] | None = None,
+    score_by_preset: Mapping[Any, int] | None = None,
     default_reasons: list[str] | None = None,
 ) -> MatchResult:
     candidates = []
+    reasons_map = reasons_by_preset or {}
+    score_map = score_by_preset or {}
     for preset in matches:
         name = preset.name
-        reasons = (reasons_by_preset or {}).get(name, default_reasons or [])
-        score = (score_by_preset or {}).get(name, confidence)
+        # Duplicate preset names are legal (different bundles/files). Prefer
+        # the object identity key, then fall back to the name for callers
+        # that still provide name-keyed diagnostic maps.
+        reasons = reasons_map.get(id(preset))
+        if reasons is None:
+            reasons = reasons_map.get(name, default_reasons or [])
+        score = score_map.get(id(preset))
+        if score is None:
+            score = score_map.get(name, confidence)
         candidates.append(
             Candidate(name, score, list(reasons), source, preset)
         )
@@ -933,13 +1396,15 @@ def _metadata_reasons(obs: Observation) -> list[str]:
 
 
 def _exact_metadata(obs: Observation, preset: PresetInfo) -> bool:
-    observed_vendor = normalize_vendor(getattr(obs, "vendor", ""))
-    observed_material = normalize_material(getattr(obs, "material", ""))
-    if not observed_vendor or not observed_material:
+    observed_vendor = _vendor_token(getattr(obs, "vendor", ""))
+    observed_family = material_family(getattr(obs, "material", ""))
+    if not observed_vendor or not observed_family:
         return False
-    if observed_vendor != normalize_vendor(getattr(preset, "vendor", "")):
+    if not _vendor_matches(obs, preset):
         return False
-    if observed_material != normalize_material(getattr(preset, "material", "")):
+    if observed_family != material_family(getattr(preset, "material", "")):
+        return False
+    if not _material_variants_match(obs, preset):
         return False
     observed_subtype = normalize_text(getattr(obs, "subtype", ""))
     if observed_subtype:
@@ -959,12 +1424,17 @@ def _history_matches_observation(obs: Observation, preset: PresetInfo) -> bool:
     change material, subtype, product or colour. A stale mapping must fall
     through to normal matching instead of blocking the user's edits.
     """
-    observed_vendor = normalize_vendor(getattr(obs, "vendor", ""))
-    if observed_vendor and observed_vendor != normalize_vendor(getattr(preset, "vendor", "")):
+    if not _vendor_matches(obs, preset):
         return False
-    observed_material = normalize_material(getattr(obs, "material", ""))
-    if observed_material and observed_material != normalize_material(getattr(preset, "material", "")):
-        return False
+    observed_family = material_family(getattr(obs, "material", ""))
+    preset_family = material_family(getattr(preset, "material", ""))
+    if observed_family:
+        if observed_family != preset_family:
+            return False
+        # Without a reported material the confirmed history is still trusted;
+        # with one, CF/GF/hardness must agree.
+        if not _material_variants_match(obs, preset):
+            return False
     observed_subtype = normalize_text(getattr(obs, "subtype", ""))
     if observed_subtype:
         subtype_level, _reason = _subtype_match(obs, preset)
@@ -972,28 +1442,67 @@ def _history_matches_observation(obs: Observation, preset: PresetInfo) -> bool:
             return False
     else:
         # With no reported subtype, the product is the only field that can
-        # distinguish e.g. a plain PLA spool from a SnapSpeed spool. Only
-        # enforce it when the history preset actually names a variant; a base
-        # preset remains valid for colour-only Spoolman names such as "Black".
-        observed_product = _core_text(getattr(obs, "product", "")).strip()
+        # distinguish e.g. a plain PLA spool from a SnapSpeed spool. Use the
+        # qualifier-aware product text so "PLA Basic" does not block a base
+        # preset. A colour-only Spoolman name gives no evidence that a
+        # variant-named history preset is still the same filament, so keep
+        # the conservative variant check for that case.
+        observed_product = _observed_product_text(obs)
         configured_subtype = normalize_text(getattr(preset, "subtype", ""))
         name_subtype = normalize_text(_name_without_vendor_material(preset))
         if observed_product and (configured_subtype or name_subtype):
             if not _products_match(observed_product, preset):
                 return False
-    distance = color_distance(
-        getattr(obs, "color", ""), getattr(preset, "color", "")
-    )
-    if distance is not None and distance > 100:
+        elif _is_color_only_product(getattr(obs, "product", "")):
+            if (configured_subtype or name_subtype) and not _products_match(
+                getattr(obs, "product", ""), preset
+            ):
+                return False
+    if _colour_veto(obs, preset):
         return False
     return True
 
 
 def _coerce_score(value: Any) -> int:
-    try:
-        return max(0, min(100, int(value)))
-    except (TypeError, ValueError):
+    """Accept both 0–100 scores and 0.0–1.0 fractional scores."""
+    if value is None or isinstance(value, bool):
         return 0
+    try:
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return 0
+            number = float(text)
+            fractional = "." in text or "e" in text.casefold()
+        elif isinstance(value, float):
+            number = value
+            fractional = True
+        else:
+            number = float(value)
+            fractional = False
+        if not math.isfinite(number):
+            return 0
+        if fractional and 0.0 <= number <= 1.0:
+            number *= 100.0
+        return max(0, min(100, int(round(number))))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _candidate_reasons(value: Any) -> list[str]:
+    """Normalize candidate reasons: string → one item, None → empty."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, Mapping):
+        values = list(value.values())
+    else:
+        try:
+            values = list(value)
+        except TypeError:
+            values = [value]
+    return [str(item) for item in values if item is not None and str(item)]
 
 
 def _normalized_library_candidates(value: Any) -> list[Candidate]:
@@ -1029,16 +1538,16 @@ def _normalized_library_candidates(value: Any) -> list[Candidate]:
         if isinstance(item, Candidate):
             preset = item.preset
             name = item.preset_name or (preset.name if preset is not None else "")
-            meta = dict(item.library_meta or {})
+            meta = item.library_meta
             result.append(
                 Candidate(
-                    preset_name=name,
+                    preset_name=_core_text(name).strip(),
                     score=_coerce_score(item.score),
-                    reasons=list(item.reasons) or ["library candidate"],
+                    reasons=_candidate_reasons(item.reasons),
                     source="library",
                     preset=preset,
-                    library_url=item.library_url,
-                    library_meta=meta,
+                    library_url=_core_text(item.library_url).strip(),
+                    library_meta=dict(meta) if isinstance(meta, Mapping) else {},
                 )
             )
             continue
@@ -1053,15 +1562,11 @@ def _normalized_library_candidates(value: Any) -> list[Candidate]:
             meta = item.get("library_meta") or item.get("meta") or item.get("metadata")
             if not isinstance(meta, Mapping):
                 meta = {key: val for key, val in item.items() if key not in known}
-            reasons = item.get("reasons") or []
-            if isinstance(reasons, str):
-                reasons = [reasons]
-            reasons = list(reasons) or ["library candidate"]
             result.append(
                 Candidate(
                     preset_name=_core_text(name).strip(),
                     score=_coerce_score(item.get("score")),
-                    reasons=reasons,
+                    reasons=_candidate_reasons(item.get("reasons")),
                     source="library",
                     preset=preset if isinstance(preset, PresetInfo) else None,
                     library_url=_core_text(
@@ -1075,12 +1580,11 @@ def _normalized_library_candidates(value: Any) -> list[Candidate]:
         url = getattr(item, "library_url", "") or getattr(item, "url", "")
         meta = getattr(item, "library_meta", {})
         preset = item if isinstance(item, PresetInfo) else getattr(item, "preset", None)
-        reasons = list(getattr(item, "reasons", []) or []) or ["library candidate"]
         result.append(
             Candidate(
                 preset_name=_core_text(name).strip(),
                 score=_coerce_score(getattr(item, "score", 0)),
-                reasons=reasons,
+                reasons=_candidate_reasons(getattr(item, "reasons", None)),
                 source="library",
                 preset=preset if isinstance(preset, PresetInfo) else None,
                 library_url=_core_text(url).strip(),
@@ -1088,7 +1592,15 @@ def _normalized_library_candidates(value: Any) -> list[Candidate]:
             )
         )
 
-    result = [candidate for candidate in result if candidate.preset_name or candidate.library_url]
+    deduped: dict[tuple[str, str], Candidate] = {}
+    for candidate in result:
+        if not (candidate.preset_name or candidate.library_url):
+            continue
+        key = (candidate.preset_name, candidate.library_url)
+        existing = deduped.get(key)
+        if existing is None or candidate.score > existing.score:
+            deduped[key] = candidate
+    result = list(deduped.values())
     result.sort(key=lambda candidate: (-candidate.score, normalize_text(candidate.preset_name)))
     return result
 
@@ -1097,7 +1609,7 @@ def _generic_matches(obs: Observation, installed: list[PresetInfo]) -> list[Pres
     material = normalize_material(getattr(obs, "material", ""))
     if not material:
         return []
-    expected = "generic " + normalize_material(getattr(obs, "material", ""))
+    expected = "generic " + material
     exact: list[tuple[float, int, str, str, PresetInfo]] = []
     prefixed: list[tuple[float, int, str, str, PresetInfo]] = []
     material_only: list[tuple[float, int, str, str, PresetInfo]] = []
@@ -1105,9 +1617,14 @@ def _generic_matches(obs: Observation, installed: list[PresetInfo]) -> list[Pres
         if not _is_generic(preset):
             continue
         preset_material = normalize_material(getattr(preset, "material", ""))
-        name = normalize_text(
-            strip_printer_suffix(strip_bundle_prefix(getattr(preset, "name", "")))
-        )
+        name = _generic_name_text(preset)
+        residual = _generic_residual_tokens(name, material)
+        # A generic variant (CF/GF/Silk/Matte/HF/SnapSpeed/Basic) must be
+        # supported by the observation. This stops a plain PLA spool from
+        # silently inheriting Generic PLA-CF just because it is the only
+        # generic preset installed.
+        if not _generic_variant_supported(obs, residual):
+            continue
         distance = color_distance(
             getattr(obs, "color", ""), getattr(preset, "color", "")
         )
@@ -1125,9 +1642,48 @@ def _generic_matches(obs: Observation, installed: list[PresetInfo]) -> list[Pres
             prefixed.append(row)
         elif preset_material == material:
             material_only.append(row)
+    # An exact base generic always outranks any variant.
     pool = exact or prefixed or material_only
     pool.sort(key=lambda row: row[:4])
     return [row[4] for row in pool]
+
+
+def _filament_id_compatible(obs: Observation, preset: PresetInfo) -> bool:
+    """An ID match still has to agree with the observed metadata."""
+    if not _vendor_matches(obs, preset):
+        return False
+    observed_family = material_family(getattr(obs, "material", ""))
+    if observed_family:
+        preset_family = material_family(getattr(preset, "material", ""))
+        if preset_family:
+            if observed_family != preset_family:
+                return False
+            if not _material_variants_match(obs, preset):
+                return False
+    if _colour_veto(obs, preset):
+        return False
+    return True
+
+
+def _filament_id_confidence(obs: Observation) -> int:
+    """Corroborated ID matches are authoritative; an ID alone is not 100."""
+    has_vendor = bool(_vendor_token(getattr(obs, "vendor", "")))
+    has_material = bool(normalize_material(getattr(obs, "material", "")))
+    if has_vendor and has_material:
+        return 100
+    if has_vendor or has_material or normalize_color(getattr(obs, "color", "")):
+        return 95
+    return 90
+
+
+def _brand_evidence(obs: Observation, preset: PresetInfo) -> bool:
+    """Strong product/subtype evidence for an unknown-vendor observation."""
+    if normalize_text(getattr(obs, "subtype", "")):
+        subtype_level, _reason = _subtype_match(obs, preset)
+        if subtype_level == 2:
+            return True
+    product = _observed_product_text(obs)
+    return bool(product) and _products_match(product, preset)
 
 
 def match_observation(
@@ -1138,18 +1694,25 @@ def match_observation(
     library_lookup: Any = None,
 ) -> MatchResult:
     """Run the matching pipeline. This function never writes history."""
-    preset_list = [preset for preset in presets if preset is not None]
+    preset_list = _dedupe_presets(
+        [preset for preset in presets if preset is not None]
+    )
     installed = sorted(_compatible(preset_list), key=_preset_sort_key)
     printer_name = _core_text(printer).strip()
+    observed_vendor = _vendor_token(getattr(obs, "vendor", ""))
 
-    # 1. User-confirmed history, provided the preset is still present/compatible.
-    history_name = _lookup_history(history, obs, printer_name)
-    if history_name:
+    # 1. User-confirmed history: spool → tag → filament, printer → default.
+    for history_name in _history_names(history, obs, printer_name):
         wanted = history_name.strip()
+        if not wanted:
+            continue
         by_name = [p for p in preset_list if _core_text(p.name).strip() == wanted]
         if not by_name:
             folded = wanted.casefold()
-            by_name = [p for p in preset_list if _core_text(p.name).strip().casefold() == folded]
+            by_name = [
+                p for p in preset_list
+                if _core_text(p.name).strip().casefold() == folded
+            ]
         compatible = [
             preset for preset in sorted(_compatible(by_name), key=_preset_sort_key)
             if _history_matches_observation(obs, preset)
@@ -1164,36 +1727,81 @@ def match_observation(
                 obs, compatible, "history", 100, default_reasons=reasons
             )
 
-    # 2. Exact printer-reported filament_id.
+    # 2. Exact printer-reported filament_id, validated against metadata.
     observed_id = _core_text(getattr(obs, "filament_id", "")).strip()
+    id_matches: list[PresetInfo] = []
     if observed_id:
-        matches = [
+        id_matches = [
             p
             for p in installed
             if _core_text(getattr(p, "filament_id", "")).strip() == observed_id
         ]
-        if matches:
+        validated = [
+            preset for preset in id_matches
+            if _filament_id_compatible(obs, preset)
+        ]
+        if validated:
             reasons = [f"filament_id {observed_id}"]
-            if len(matches) == 1:
-                return _selected_result(obs, matches[0], "installed", 100, reasons)
-            return _multi_result(obs, matches, "installed", 100)
+            confidence = _filament_id_confidence(obs)
+            if len(validated) == 1:
+                return _selected_result(
+                    obs, validated[0], "installed", confidence, reasons
+                )
+            reasons_by_preset = {id(preset): reasons for preset in validated}
+            scores_by_preset = {id(preset): confidence for preset in validated}
+            return _multi_result(
+                obs,
+                validated,
+                "installed",
+                confidence,
+                reasons_by_preset,
+                scores_by_preset,
+            )
 
     # 3. Exact vendor + material + subtype + product (blank obs parts unknown).
     matches = [p for p in installed if _exact_metadata(obs, p)]
     if matches:
-        if not normalize_text(getattr(obs, "subtype", "")):
-            matches.sort(key=_exact_match_sort_key)
-        reasons = _metadata_reasons(obs)
-        if len(matches) == 1:
-            return _selected_result(obs, matches[0], "installed", 95, reasons)
+        colour_ok = [p for p in matches if not _colour_veto(obs, p)]
+        if colour_ok:
+            matches = colour_ok
+            if not normalize_text(getattr(obs, "subtype", "")):
+                matches.sort(key=_exact_match_sort_key)
+            reasons = _metadata_reasons(obs)
+            if len(matches) == 1:
+                return _selected_result(obs, matches[0], "installed", 95, reasons)
+            return _multi_result(
+                obs, matches, "installed", 95, default_reasons=reasons
+            )
+        # Only colour differs: present candidates instead of auto-selecting.
+        reasons_by_preset = {}
+        scores_by_preset = {}
+        for preset in matches:
+            distance = color_distance(
+                getattr(obs, "color", ""), getattr(preset, "color", "")
+            )
+            reasons = list(_metadata_reasons(obs))
+            if distance is not None:
+                reasons.append(f"colour Δ{distance:.0f}")
+            reasons_by_preset[id(preset)] = reasons
+            scores_by_preset[id(preset)] = 90
         return _multi_result(
-            obs, matches, "installed", 95, default_reasons=reasons
+            obs,
+            matches,
+            "installed",
+            90,
+            reasons_by_preset,
+            scores_by_preset,
         )
 
-    # 4. Fuzzy score: threshold, then margin over the next qualifying candidate.
+    # 4. Fuzzy score: threshold, hard vendor/material gates, and a margin
+    #    against the next scored preset even when it is below the threshold.
     scored: list[tuple[int, list[str], PresetInfo]] = []
     for preset in installed:
         if _is_generic(preset):
+            continue
+        if not _material_matches(obs, preset):
+            continue
+        if observed_vendor and not _vendor_matches(obs, preset):
             continue
         score, reasons = score_preset(obs, preset)
         if score > 0:
@@ -1207,22 +1815,41 @@ def match_observation(
             row[2].name,
         )
     )
-    qualified = [row for row in scored if row[0] >= FUZZY_THRESHOLD]
-    if qualified:
-        top_score = qualified[0][0]
-        if len(qualified) == 1 or top_score - qualified[1][0] >= FUZZY_MARGIN:
+    if scored and scored[0][0] >= FUZZY_THRESHOLD:
+        top_score, top_reasons, top_preset = scored[0]
+        runner_score = scored[1][0] if len(scored) > 1 else None
+        margin_ok = (
+            runner_score is None
+            or top_score - runner_score >= FUZZY_MARGIN
+        )
+        evidence_ok = bool(observed_vendor) or _brand_evidence(obs, top_preset)
+        if margin_ok and evidence_ok and not _colour_veto(obs, top_preset):
             return _selected_result(
-                obs, qualified[0][2], "installed", top_score, qualified[0][1]
+                obs, top_preset, "installed", top_score, top_reasons
             )
-        reasons_by_preset = {row[2].name: row[1] for row in qualified}
-        scores_by_preset = {row[2].name: row[0] for row in qualified}
+        rows = [
+            row for row in scored
+            if row[0] >= top_score - FUZZY_MARGIN + 1
+        ]
+        reasons_by_preset = {id(row[2]): row[1] for row in rows}
+        scores_by_preset = {id(row[2]): row[0] for row in rows}
         return _multi_result(
             obs,
-            [row[2] for row in qualified],
+            [row[2] for row in rows],
             "installed",
             top_score,
             reasons_by_preset,
             scores_by_preset,
+        )
+
+    # A printer-reported ID that conflicts with the observed metadata is a
+    # strong hint, but it must be a chooser rather than an automatic apply.
+    if id_matches:
+        reasons = [
+            f"filament_id {observed_id} conflicts with observed metadata"
+        ]
+        return _multi_result(
+            obs, id_matches, "installed", 80, default_reasons=reasons
         )
 
     # 5. Library lookup: candidates for review, never selected/installed here.
