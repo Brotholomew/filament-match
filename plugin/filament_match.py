@@ -1855,10 +1855,14 @@ def _library_candidates(observation, settings, storage, session, warnings):
 def _history_store(storage, warnings):
     cls = _DEPS["HistoryStore"]
     try:
-        return cls(_history_path(storage))
+        store = cls(_history_path(storage))
     except Exception as error:
         _warn(warnings, "History could not be opened: %s" % _error_text(error))
         return _EmptyHistory()
+    load_error = _text(getattr(store, "load_error", ""))
+    if load_error:
+        _warn(warnings, "History could not be read: %s" % load_error)
+    return store
 
 
 class _EmptyHistory:
@@ -2450,6 +2454,9 @@ def _validate_preset_config_keys(preset, snapshot):
         "name", "from", "type", "instantiation", "inherits", "description",
         "filament_settings_id", "filament_id", "filament_ids", "setting_id",
         "base_id", "is_system", "system", "bundle_id", "version",
+        # Orca writes this metadata flag in local/OFD presets; it is not a
+        # PrintConfig key and must never be treated as an unknown option.
+        "is_custom_defined",
         # Core filament options every OrcaFilamentLibrary config exposes; a
         # minimal test/fake key catalog may not list them.
         "filament_cost", "filament_type", "filament_vendor", "filament_colour",
@@ -3127,8 +3134,12 @@ def _apply_selection(message, snapshot, settings, storage, session, warnings,
     if remember and source != "generic":
         try:
             history = _history_store(storage, warnings)
-            history.remember(observation, snapshot.get("printer") or "", name)
-            remembered = True
+            stored = history.remember(
+                observation, snapshot.get("printer") or "", name)
+            remembered = bool(stored)
+            if not remembered:
+                _warn(warnings,
+                       "Selected, but the history store did not save the mapping.")
         except Exception as error:
             _warn(warnings, "Selected, but could not remember the mapping: %s"
                    % _error_text(error))

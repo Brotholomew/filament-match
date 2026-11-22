@@ -2002,6 +2002,26 @@ class IntegrationSimulationTests(unittest.TestCase):
         self.assertEqual(
             self.module._preset_file_json(str(path))["name"], "BOM preset")
 
+    def test_ofd_is_custom_defined_metadata_is_allowed(self):
+        snapshot = self._snapshot()
+        snapshot.update({
+            "data_dir": self.storage,
+            "folder": "profile",
+            "folder_inferred": True,
+            "config_keys": ["filament_type", "filament_vendor", "filament_cost"],
+            "config_keys_complete": True,
+        })
+        self.module._validate_preset_config_keys({
+            "name": "OFD Test",
+            "from": "User",
+            "type": "filament",
+            "instantiation": "true",
+            "inherits": "Generic PETG @System",
+            "filament_type": ["PETG"],
+            "is_custom_defined": "0",
+            "version": "2.0.2.0",
+        }, snapshot)
+
     def test_write_local_preset_refuses_to_overwrite_corrupt_json(self):
         snapshot = self._prepared_snapshot([
             FakePreset("Generic PLA @Test", vendor="Generic", material="PLA"),

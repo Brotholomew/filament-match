@@ -206,17 +206,17 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertFalse(store.forget(self._obs(spool_id=123)))
         self.assertFalse(self.path.exists())
 
-    def test_corrupt_file_is_reported_then_replaced_by_next_write(self):
+    def test_corrupt_file_is_reported_and_not_overwritten(self):
         self.path.parent.mkdir(parents=True)
         self.path.write_text("{not json", encoding="utf-8")
+        before = self.path.read_bytes()
         store = core.HistoryStore(self.path)
         self.assertTrue(store.load_error)
         self.assertEqual(store.get(self._obs(spool_id=1), "U1"), "")
 
-        store.remember(self._obs(spool_id=1), "U1", "Good Preset")
-        reloaded = core.HistoryStore(self.path)
-        self.assertEqual(reloaded.load_error, "")
-        self.assertEqual(reloaded.get(self._obs(spool_id=1), "U1"), "Good Preset")
+        with self.assertRaises(RuntimeError):
+            store.remember(self._obs(spool_id=1), "U1", "Good Preset")
+        self.assertEqual(self.path.read_bytes(), before)
 
     def test_failed_atomic_replace_keeps_old_file_and_memory(self):
         store = core.HistoryStore(self.path)

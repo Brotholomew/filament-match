@@ -1063,6 +1063,10 @@ class HistoryStore:
         preset: str | PresetInfo | Candidate,
     ) -> str:
         """Persist a user-confirmed mapping and return the identity key."""
+        if self.load_error:
+            raise RuntimeError(
+                "The history file could not be read; refusing to overwrite it: %s"
+                % self.load_error)
         name = _preset_name(preset)
         if not name:
             raise ValueError("preset name is required")

@@ -148,7 +148,7 @@ def _():
 
 @check("Spoolman URL with /api/v1 is normalized")
 def _():
-    value = sources.normalize_base_url("http://spoolman:7912/api/v1")
+    value = sources.normalize_spoolman_url("http://spoolman:7912/api/v1")
     assert not value.endswith("/api/v1"), value
 
 
