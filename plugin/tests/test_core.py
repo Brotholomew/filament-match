@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import json
 import sys
@@ -104,7 +105,8 @@ class IdentityAndNormalizationTests(unittest.TestCase):
         self.assertEqual(
             core.strip_printer_suffix("CC3D PETG @U1 0.4"), "CC3D PETG"
         )
-        self.assertEqual(core.strip_bundle_prefix("[vendor] PLA"), "PLA")
+        self.assertEqual(core.strip_bundle_prefix("[vendor] PLA"),
+                         "[vendor] PLA")
         self.assertEqual(core.strip_color_words("Galaxy Black PLA"), "galaxy pla")
         self.assertEqual(core.normalize_color("#F06292FF"), "#f06292")
         self.assertEqual(core.normalize_color("bad"), "")
@@ -142,7 +144,7 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertTrue(self.path.exists())
 
         document = json.loads(self.path.read_text(encoding="utf-8"))
-        self.assertEqual(document["version"], 1)
+        self.assertEqual(document["version"], 2)
         self.assertEqual(document["spools"]["42"]["default"], "CC3D PETG @U1 0.4")
         self.assertEqual(
             document["spools"]["42"]["printers"]["Snapmaker U1 (0.4 nozzle)"],
@@ -197,7 +199,7 @@ class HistoryStoreTests(unittest.TestCase):
         store.clear()
         self.assertEqual(store.get(filament_obs, "U1"), "")
         document = json.loads(self.path.read_text(encoding="utf-8"))
-        self.assertEqual(document, {"version": 1, "spools": {}, "tags": {}, "filaments": {}})
+        self.assertEqual(document, {"version": 2, "spools": {}, "tags": {}, "filaments": {}})
 
     def test_forget_unknown_identity_is_false_and_does_not_write(self):
         store = core.HistoryStore(self.path)
@@ -867,6 +869,669 @@ class MatchingTests(unittest.TestCase):
         result = core.match_observation(obs, presets)
         self.assertTrue(result.error)
         self.assertEqual(result.candidates, [])
+
+
+class UnicodeNormalizationTests(unittest.TestCase):
+    def test_unicode_text_is_preserved_and_trademarks_are_removed(self):
+        self.assertEqual(core.normalize_vendor("Полимер"), "полимер")
+        self.assertTrue(core.normalize_vendor("Другой"))
+        self.assertNotEqual(core.normalize_vendor("Полимер"),
+                            core.normalize_vendor("Другой"))
+        self.assertEqual(core.normalize_text("Πλάσμα"), "πλασμα")
+        self.assertEqual(core.normalize_text("牙科树脂"), "牙科树脂")
+        self.assertEqual(core.normalize_text("Prüsa"), "prusa")
+        self.assertEqual(core.normalize_text("Acme™"), "acme")
+        self.assertEqual(core.normalize_text("Bambu Lab®"), "bambu lab")
+        self.assertEqual(core.normalize_text("©2026"), "2026")
+
+    def test_non_ascii_vendors_produce_distinct_identity_keys(self):
+        first = make_obs(vendor="Полимер", material="PETG",
+                         product="Pink", color="#ff0000")
+        second = make_obs(vendor="Другой", material="PETG",
+                          product="Pink", color="#ff0000")
+        self.assertTrue(core.identity_key(first).startswith("filament:"))
+        self.assertTrue(core.identity_key(second).startswith("filament:"))
+        self.assertNotEqual(core.identity_key(first), core.identity_key(second))
+
+    def test_non_ascii_vendor_exact_matching_is_vendor_specific(self):
+        first = make_preset("Полимер PETG", vendor="Полимер", material="PETG")
+        second = make_preset("Другой PETG", vendor="Другой", material="PETG")
+        obs = make_obs(vendor="Полимер", material="PETG", product="Pink",
+                       color="#ff0000")
+        result = core.match_observation(obs, [first, second])
+        self.assertEqual(result.source, "installed")
+        self.assertEqual(result.preset_name, first.name)
+
+    def test_history_does_not_cross_non_ascii_vendors(self):
+        first = make_preset("Полимер PETG", vendor="Полимер", material="PETG")
+        second = make_preset("Другой PETG", vendor="Другой", material="PETG")
+        first_obs = make_obs(vendor="Полимер", material="PETG",
+                             product="Pink", color="#ff0000")
+        second_obs = make_obs(vendor="Другой", material="PETG",
+                              product="Pink", color="#ff0000")
+        with tempfile.TemporaryDirectory() as directory:
+            store = core.HistoryStore(Path(directory) / "history.json")
+            store.remember(first_obs, "U1", first.name)
+            result = core.match_observation(
+                second_obs, [first, second], store, "U1")
+        self.assertNotEqual(result.preset_name, first.name)
+        self.assertEqual(result.preset_name, second.name)
+
+    def test_raw_value_is_used_when_normalization_is_empty(self):
+        # Trademark-only vendors normalize to nothing. The raw value must still
+        # participate in identity and the history vendor check.
+        first = make_obs(vendor="™", material="PETG", product="Pink",
+                         color="#ff0000")
+        second = make_obs(vendor="®", material="PETG", product="Pink",
+                          color="#ff0000")
+        self.assertNotEqual(core.identity_key(first), core.identity_key(second))
+
+        first_preset = make_preset("Mark One PETG", vendor="™", material="PETG")
+        second_preset = make_preset("Mark Two PETG", vendor="®", material="PETG")
+        with tempfile.TemporaryDirectory() as directory:
+            store = core.HistoryStore(Path(directory) / "history.json")
+            store.remember(first, "U1", first_preset.name)
+            result = core.match_observation(
+                second, [first_preset, second_preset], store, "U1")
+        self.assertEqual(result.preset_name, second_preset.name)
+        self.assertNotEqual(result.source, "history")
+
+    def test_raw_product_value_does_not_bypass_history_product_check(self):
+        preset = make_preset("eSUN PETG Matte", vendor="eSUN", material="PETG")
+        obs = make_obs(vendor="eSUN", material="PETG", product="™",
+                       spool_id=78)
+        with tempfile.TemporaryDirectory() as directory:
+            store = core.HistoryStore(Path(directory) / "history.json")
+            store.remember(obs, "U1", preset.name)
+            result = core.match_observation(obs, [preset], store, "U1")
+        self.assertNotEqual(result.source, "history")
+        self.assertNotEqual(result.preset_name, preset.name)
+
+
+class HistoryFileTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "history.json"
+
+    def _obs(self, **kwargs):
+        base = dict(slot=1, vendor="CC3D", material="PETG")
+        base.update(kwargs)
+        return make_obs(**base)
+
+    def test_invalid_utf8_is_reported_instead_of_raising(self):
+        self.path.write_bytes(b"\xff\xfe\x00")
+        store = core.HistoryStore(self.path)
+        self.assertTrue(store.load_error)
+        self.assertEqual(store.get(self._obs(spool_id=1), "U1"), "")
+
+    def test_bom_prefixed_history_loads(self):
+        document = {
+            "version": 1,
+            "spools": {"7": {"default": "BOM Preset"}},
+            "tags": {},
+            "filaments": {},
+        }
+        payload = json.dumps(document).encode("utf-8")
+        self.path.write_bytes(codecs.BOM_UTF8 + payload)
+        store = core.HistoryStore(self.path)
+        self.assertEqual(store.load_error, "")
+        self.assertEqual(store.get(self._obs(spool_id=7), "U1"), "BOM Preset")
+
+    def test_remember_rejects_a_preset_without_a_name(self):
+        store = core.HistoryStore(self.path)
+        with self.assertRaises(ValueError):
+            store.remember(self._obs(spool_id=1), "U1", object())
+        self.assertFalse(self.path.exists())
+
+    def test_remember_failure_propagates(self):
+        store = core.HistoryStore(self.path)
+        obs = self._obs(spool_id=5)
+        with mock.patch.object(core.os, "replace", side_effect=OSError("denied")):
+            with self.assertRaises(OSError):
+                store.remember(obs, "U1", "Unwritable Preset")
+        self.assertEqual(store.get(obs, "U1"), "")
+        self.assertFalse(self.path.exists())
+
+
+class HistoryCascadeTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "history.json"
+
+    def test_tag_history_supplies_identity_when_spool_history_is_missing(self):
+        tag_obs = make_obs(vendor="CC3D", material="PETG", tag_uid="AA:BB")
+        spool_obs = make_obs(vendor="CC3D", material="PETG", tag_uid="AA:BB",
+                             spool_id=42)
+        preset = make_preset("CC3D PETG", vendor="CC3D", material="PETG")
+        store = core.HistoryStore(self.path)
+        store.remember(tag_obs, "U1", preset.name)
+
+        result = core.match_observation(spool_obs, [preset], store, "U1")
+        self.assertEqual(result.source, "history")
+        self.assertEqual(result.preset_name, preset.name)
+
+    def test_filament_history_supplies_identity_when_spool_and_tag_miss(self):
+        filament_obs = make_obs(vendor="CC3D", material="PETG",
+                                product="Pink", color="#ff0000")
+        spool_obs = make_obs(vendor="CC3D", material="PETG",
+                             product="Pink", color="#ff0000",
+                             tag_uid="CC:DD", spool_id=43)
+        preset = make_preset("CC3D PETG", vendor="CC3D", material="PETG")
+        store = core.HistoryStore(self.path)
+        store.remember(filament_obs, "U1", preset.name)
+
+        result = core.match_observation(spool_obs, [preset], store, "U1")
+        self.assertEqual(result.source, "history")
+        self.assertEqual(result.preset_name, preset.name)
+
+    def test_stale_printer_preset_falls_back_to_default(self):
+        obs = make_obs(vendor="CC3D", material="PETG", spool_id=51)
+        default = make_preset("Default PETG", vendor="CC3D", material="PETG")
+        store = core.HistoryStore(self.path)
+        store.remember(obs, "Printer A", "Deleted Preset")
+        store.remember(obs, "Printer B", default.name)
+
+        result = core.match_observation(obs, [default], store, "Printer A")
+        self.assertEqual(result.source, "history")
+        self.assertEqual(result.preset_name, default.name)
+
+    def test_incompatible_printer_preset_falls_back_to_default(self):
+        obs = make_obs(vendor="CC3D", material="PETG", spool_id=52)
+        stale = make_preset("Stale PETG", vendor="CC3D", material="PETG",
+                            compatible=False)
+        default = make_preset("Default PETG", vendor="CC3D", material="PETG")
+        store = core.HistoryStore(self.path)
+        store.remember(obs, "Printer A", stale.name)
+        store.remember(obs, "Printer B", default.name)
+
+        result = core.match_observation(obs, [stale, default], store, "Printer A")
+        self.assertEqual(result.source, "history")
+        self.assertEqual(result.preset_name, default.name)
+
+    def test_mismatched_spool_history_falls_through_to_tag_history(self):
+        spool_obs = make_obs(vendor="CC3D", material="PETG", spool_id=53)
+        bad = make_preset("Old PETG", vendor="CC3D", material="PETG")
+        tag_obs = make_obs(vendor="CC3D", material="PLA", tag_uid="EE:FF")
+        good = make_preset("New PLA", vendor="CC3D", material="PLA")
+        current = make_obs(vendor="CC3D", material="PLA", spool_id=53,
+                           tag_uid="EE:FF")
+        store = core.HistoryStore(self.path)
+        store.remember(spool_obs, "U1", bad.name)
+        store.remember(tag_obs, "U1", good.name)
+
+        result = core.match_observation(current, [bad, good], store, "U1")
+        self.assertEqual(result.source, "history")
+        self.assertEqual(result.preset_name, good.name)
+
+
+class VendorMaterialGateTests(unittest.TestCase):
+    def test_known_vendor_mismatch_is_not_auto_selected(self):
+        # Audit repro: mismatch used to score 71+ and auto-select ACME.
+        preset = make_preset("ACME PETG Matte", vendor="ACME", material="PETG",
+                             subtype="Matte", product="Matte", color="#ff0000")
+        obs = make_obs(vendor="eSUN", material="PETG", subtype="Matte",
+                       product="Matte", color="#ff0000")
+        result = core.match_observation(obs, [preset])
+        self.assertNotEqual(result.preset_name, preset.name)
+        self.assertTrue(result.error)
+
+    def test_material_mismatch_is_a_veto(self):
+        preset = make_preset("CC3D PETG Matte", vendor="CC3D", material="PETG",
+                             subtype="Matte", product="Matte", color="#ff0000")
+        obs = make_obs(vendor="CC3D", material="PLA", subtype="Matte",
+                       product="Matte", color="#ff0000")
+        result = core.match_observation(obs, [preset])
+        self.assertNotEqual(result.preset_name, preset.name)
+        self.assertTrue(result.error)
+
+    def test_unknown_vendor_returns_candidates_without_strong_evidence(self):
+        preset = make_preset("ACME PLA", vendor="ACME", material="PLA")
+        obs = make_obs(material="PLA", product="Pink", color="#ff0000")
+        with mock.patch.object(core, "score_preset",
+                               return_value=(80, ["material PLA"])):
+            result = core.match_observation(obs, [preset])
+        self.assertEqual(result.preset_name, "")
+        self.assertEqual(len(result.candidates), 1)
+        self.assertEqual(result.candidates[0].preset_name, preset.name)
+
+    def test_unknown_vendor_may_select_with_strong_subtype_evidence(self):
+        preset = make_preset("ACME PETG Matte", vendor="ACME", material="PETG",
+                             subtype="Matte", product="Matte", color="#ff0000")
+        obs = make_obs(material="PETG", subtype="Matte", product="Matte",
+                       color="#ff0000")
+        result = core.match_observation(obs, [preset])
+        self.assertEqual(result.preset_name, preset.name)
+
+
+class GenericVariantTests(unittest.TestCase):
+    def test_plain_pla_does_not_fall_back_to_generic_pla_cf(self):
+        preset = make_preset("Generic PLA-CF @System", base="Generic PLA-CF",
+                             vendor="Generic", material="PLA")
+        obs = make_obs(material="PLA", product="Pink", color="#ff0000")
+        result = core.match_observation(obs, [preset])
+        self.assertNotEqual(result.preset_name, preset.name)
+        self.assertTrue(result.error)
+
+    def test_generic_pet_g_name_matches_petg(self):
+        preset = make_preset("Generic PET-G @System", base="Generic PET-G",
+                             vendor="Generic", material="PETG")
+        obs = make_obs(material="PETG", product="Pink", color="#ff0000")
+        result = core.match_observation(obs, [preset])
+        self.assertEqual(result.preset_name, preset.name)
+        self.assertEqual(result.source, "generic")
+
+    def test_exact_base_generic_ranks_ahead_of_variant(self):
+        base = make_preset("Generic PLA @System", base="Generic PLA",
+                           vendor="Generic", material="PLA", color="#000000")
+        variant = make_preset("Generic PLA-CF @System", base="Generic PLA-CF",
+                              vendor="Generic", material="PLA", color="#F4C032")
+        obs = make_obs(material="PLA", subtype="CF", color="#F4C032")
+        result = core.match_observation(obs, [variant, base])
+        self.assertEqual(result.preset_name, base.name)
+
+    def test_variant_is_used_when_the_observation_supports_it(self):
+        variant = make_preset("Generic PLA-CF @System", base="Generic PLA-CF",
+                              vendor="Generic", material="PLA", color="#F4C032")
+        obs = make_obs(material="PLA", subtype="CF", color="#F4C032")
+        result = core.match_observation(obs, [variant])
+        self.assertEqual(result.preset_name, variant.name)
+        self.assertEqual(result.source, "generic")
+
+    def test_plain_pla_does_not_fall_back_to_generic_pla_basic(self):
+        preset = make_preset("Generic PLA Basic @System", base="Generic PLA Basic",
+                             vendor="Generic", material="PLA")
+        obs = make_obs(material="PLA", product="Pink", color="#ff0000")
+        result = core.match_observation(obs, [preset])
+        self.assertNotEqual(result.preset_name, preset.name)
+
+    def test_matte_generic_is_used_when_product_reports_matte(self):
+        preset = make_preset("Generic PETG Matte @System",
+                             base="Generic PETG Matte", vendor="Generic",
+                             material="PETG")
+        obs = make_obs(material="PETG", product="PETG Matte")
+        result = core.match_observation(obs, [preset])
+        self.assertEqual(result.preset_name, preset.name)
+
+
+class MaterialAliasTests(unittest.TestCase):
+    def test_pla_plus_matches_a_pla_family_preset(self):
+        preset = make_preset("eSUN PLA @System", vendor="eSUN", material="PLA",
+                             color="#00ff00")
+        obs = make_obs(vendor="eSUN", material="PLA+", product="Green",
+                       color="#00ff00")
+        result = core.match_observation(obs, [preset])
+        self.assertEqual(result.source, "installed")
+        self.assertEqual(result.preset_name, preset.name)
+        self.assertEqual(result.confidence, 95)
+
+    def test_pla_plus_and_plain_pla_share_identity(self):
+        plus = make_obs(vendor="eSUN", material="PLA+", product="Pink",
+                        color="#ff0000")
+        plain = make_obs(vendor="eSUN", material="PLA", product="Pink",
+                         color="#ff0000")
+        self.assertEqual(core.identity_key(plus), core.identity_key(plain))
+
+    def test_nylon_and_pa_share_the_same_family(self):
+        self.assertEqual(core.normalize_material("Nylon"), "pa")
+        self.assertEqual(core.normalize_material("PA"), "pa")
+        self.assertEqual(core.normalize_material("Nylon-CF"), "pa cf")
+
+    def test_cf_variants_keep_the_variant_in_the_canonical_material(self):
+        self.assertEqual(core.normalize_material("PETG-CF"), "petg cf")
+        self.assertEqual(core.normalize_material("PLA-CF"), "pla cf")
+
+    def test_tpu_hardness_is_preserved(self):
+        self.assertEqual(core.normalize_material("TPU-95A"), "tpu 95a")
+        self.assertEqual(core.normalize_material("TPU 95A"), "tpu 95a")
+
+
+class FilamentIdValidationTests(unittest.TestCase):
+    def test_id_with_wrong_vendor_is_not_selected(self):
+        preset = make_preset("ACME PETG", vendor="ACME", material="PETG",
+                             filament_id="FID", color="#00ff00")
+        obs = make_obs(vendor="eSUN", material="PETG", filament_id="FID",
+                       color="#00ff00")
+        result = core.match_observation(obs, [preset])
+        self.assertNotEqual(result.preset_name, preset.name)
+
+    def test_id_with_wrong_material_is_not_selected(self):
+        preset = make_preset("CC3D PETG", vendor="CC3D", material="PETG",
+                             filament_id="FID")
+        obs = make_obs(vendor="CC3D", material="PLA", filament_id="FID")
+        result = core.match_observation(obs, [preset])
+        self.assertNotEqual(result.preset_name, preset.name)
+
+    def test_id_with_wrong_colour_is_not_selected(self):
+        preset = make_preset("CC3D PETG", vendor="CC3D", material="PETG",
+                             filament_id="FID", color="#00ff00")
+        obs = make_obs(vendor="CC3D", material="PETG", filament_id="FID",
+                       color="#ff0000")
+        result = core.match_observation(obs, [preset])
+        self.assertNotEqual(result.preset_name, preset.name)
+
+    def test_validated_id_still_selects(self):
+        preset = make_preset("CC3D PETG", vendor="CC3D", material="PETG",
+                             filament_id="FID", color="#ff0000")
+        obs = make_obs(vendor="CC3D", material="PETG", filament_id="FID",
+                       color="#ff0000")
+        result = core.match_observation(obs, [preset])
+        self.assertEqual(result.preset_name, preset.name)
+        self.assertEqual(result.confidence, 100)
+
+    def test_id_alone_is_not_full_confidence(self):
+        preset = make_preset("CC3D PETG", vendor="CC3D", material="PETG",
+                             filament_id="FID")
+        obs = make_obs(filament_id="FID")
+        result = core.match_observation(obs, [preset])
+        self.assertEqual(result.preset_name, preset.name)
+        self.assertLess(result.confidence, 100)
+
+
+class ColourVetoTests(unittest.TestCase):
+    def test_unique_wrong_colour_returns_a_candidate_not_a_selection(self):
+        preset = make_preset("CC3D PETG", vendor="CC3D", material="PETG",
+                             color="#00ff00")
+        obs = make_obs(vendor="CC3D", material="PETG", product="Pink",
+                       color="#ff0000")
+        result = core.match_observation(obs, [preset])
+        self.assertEqual(result.preset_name, "")
+        self.assertEqual(len(result.candidates), 1)
+        self.assertEqual(result.candidates[0].preset_name, preset.name)
+        self.assertIn("colour", " ".join(result.candidates[0].reasons).casefold())
+
+    def test_multiple_colour_variants_prefer_the_closest_colour(self):
+        red = make_preset("CC3D PETG Red", vendor="CC3D", material="PETG",
+                          color="#ff0000")
+        blue = make_preset("CC3D PETG Blue", vendor="CC3D", material="PETG",
+                           color="#0000ff")
+        obs = make_obs(vendor="CC3D", material="PETG", product="Pink",
+                       color="#fe0101")
+        result = core.match_observation(obs, [blue, red])
+        self.assertEqual(result.preset_name, red.name)
+
+    def test_missing_preset_colour_is_not_a_veto(self):
+        preset = make_preset("CC3D PETG", vendor="CC3D", material="PETG")
+        obs = make_obs(vendor="CC3D", material="PETG", product="Pink",
+                       color="#ff0000")
+        result = core.match_observation(obs, [preset])
+        self.assertEqual(result.preset_name, preset.name)
+
+
+class ProductSemanticsTests(unittest.TestCase):
+    def test_colour_and_material_only_product_text_is_unconstrained(self):
+        cases = (
+            ("PLA Basic", "PLA"),
+            ("PETG Pink", "PETG"),
+            ("White", "PETG"),
+            ("PETG", "PETG"),
+            ("PETG Basic Transparent Green", "PETG"),
+        )
+        for product, material in cases:
+            obs = make_obs(vendor="eSUN", material=material, product=product)
+            self.assertEqual(core._observed_product_text(obs), "", product)
+
+    def test_meaningful_product_qualifiers_are_kept(self):
+        pastel = make_obs(vendor="eSUN", material="ABS", product="ABS Pastel")
+        matte = make_obs(vendor="eSUN", material="PETG", product="PETG Matte")
+        self.assertEqual(core._observed_product_text(pastel), "abs pastel")
+        self.assertEqual(core._observed_product_text(matte), "petg matte")
+
+    def test_abs_pastel_still_selects_the_pastel_preset(self):
+        base = make_preset("eSUN ABS", vendor="eSUN", material="ABS")
+        pastel = make_preset("eSUN ABS Pastel", vendor="eSUN", material="ABS")
+        obs = make_obs(vendor="eSUN", material="ABS", product="ABS Pastel")
+        result = core.match_observation(obs, [base, pastel])
+        self.assertEqual(result.preset_name, pastel.name)
+
+    def test_petg_matte_still_selects_the_matte_preset(self):
+        base = make_preset("eSUN PETG", vendor="eSUN", material="PETG")
+        matte = make_preset("eSUN PETG Matte", vendor="eSUN", material="PETG")
+        obs = make_obs(vendor="eSUN", material="PETG", product="PETG Matte")
+        result = core.match_observation(obs, [base, matte])
+        self.assertEqual(result.preset_name, matte.name)
+
+    def test_pla_basic_product_does_not_block_the_base_preset(self):
+        preset = make_preset("eSUN PLA", vendor="eSUN", material="PLA")
+        obs = make_obs(vendor="eSUN", material="PLA", product="PLA Basic")
+        result = core.match_observation(obs, [preset])
+        self.assertEqual(result.preset_name, preset.name)
+        self.assertEqual(result.confidence, 95)
+
+    def test_pla_basic_product_does_not_block_history_validation(self):
+        preset = make_preset("eSUN PLA Matte", vendor="eSUN", material="PLA")
+        obs = make_obs(vendor="eSUN", material="PLA", product="PLA Basic",
+                       spool_id=77)
+        with tempfile.TemporaryDirectory() as directory:
+            store = core.HistoryStore(Path(directory) / "history.json")
+            store.remember(obs, "U1", preset.name)
+            result = core.match_observation(obs, [preset], store, "U1")
+        self.assertEqual(result.source, "history")
+        self.assertEqual(result.preset_name, preset.name)
+
+
+class DuplicatePresetTests(unittest.TestCase):
+    def test_identical_presets_are_deduplicated_before_matching(self):
+        first = make_preset("CC3D PETG", vendor="CC3D", material="PETG",
+                            bundle_id="bundle", file="a.json")
+        second = make_preset("CC3D PETG", vendor="CC3D", material="PETG",
+                             bundle_id="bundle", file="a.json")
+        obs = make_obs(vendor="CC3D", material="PETG")
+        result = core.match_observation(obs, [first, second])
+        self.assertEqual(result.preset_name, first.name)
+        self.assertEqual(len(result.candidates), 1)
+
+    def test_same_name_candidates_keep_their_own_scores_and_reasons(self):
+        first = make_preset("CC3D PETG", vendor="CC3D", material="PETG",
+                            bundle_id="a", file="a.json", color="#F06292")
+        second = make_preset("CC3D PETG", vendor="CC3D", material="PETG",
+                             bundle_id="b", file="b.json", color="#C86080")
+        obs = make_obs(vendor="CC3D", material="PETG",
+                       product="CC3D PETG Pro", color="#F06292")
+
+        def fake_score(_obs, preset):
+            if preset.file == "a.json":
+                return 80, ["first reason"]
+            return 72, ["second reason"]
+
+        with mock.patch.object(core, "score_preset", side_effect=fake_score):
+            result = core.match_observation(obs, [first, second])
+
+        self.assertEqual(result.preset_name, "")
+        self.assertEqual(len(result.candidates), 2)
+        by_file = {candidate.preset.file: candidate for candidate in result.candidates}
+        self.assertEqual(by_file["a.json"].score, 80)
+        self.assertEqual(by_file["a.json"].reasons, ["first reason"])
+        self.assertEqual(by_file["b.json"].score, 72)
+        self.assertEqual(by_file["b.json"].reasons, ["second reason"])
+
+
+class LibraryCandidateTests(unittest.TestCase):
+    def test_reasons_and_scores_are_normalized(self):
+        obs = make_obs(vendor="ACME", material="PETG", product="ACME PETG")
+        result = core.match_observation(
+            obs,
+            [],
+            library_lookup=lambda _obs: [
+                {"profile_name": "ACME PETG A", "url": "https://x/a.json",
+                 "score": 0.85, "reasons": "index hit"},
+                {"profile_name": "ACME PETG B", "url": "https://x/b.json",
+                 "score": 72, "reasons": None},
+            ],
+        )
+        self.assertEqual(result.source, "library")
+        by_name = {candidate.preset_name: candidate
+                   for candidate in result.candidates}
+        self.assertEqual(by_name["ACME PETG A"].score, 85)
+        self.assertEqual(by_name["ACME PETG A"].reasons, ["index hit"])
+        self.assertEqual(by_name["ACME PETG B"].score, 72)
+        self.assertEqual(by_name["ACME PETG B"].reasons, [])
+
+    def test_library_candidates_are_deduplicated(self):
+        obs = make_obs(vendor="ACME", material="PETG", product="ACME PETG")
+        result = core.match_observation(
+            obs,
+            [],
+            library_lookup=lambda _obs: [
+                {"profile_name": "ACME PETG", "url": "https://x/a.json",
+                 "score": 0.5, "reasons": "first"},
+                {"profile_name": "ACME PETG", "url": "https://x/a.json",
+                 "score": 0.9, "reasons": "second"},
+            ],
+        )
+        self.assertEqual(len(result.candidates), 1)
+        self.assertEqual(result.candidates[0].score, 90)
+
+    def test_candidate_objects_with_string_or_missing_reasons(self):
+        candidates = [
+            core.Candidate("A", 0.75, "one hit", "library",
+                           library_url="https://x/a.json"),
+            core.Candidate("B", 60, None, "library",
+                           library_url="https://x/b.json"),
+        ]
+        result = core.match_observation(
+            make_obs(vendor="ACME", material="PETG"),
+            [],
+            library_lookup=lambda _obs: candidates,
+        )
+        by_name = {candidate.preset_name: candidate
+                   for candidate in result.candidates}
+        self.assertEqual(by_name["A"].score, 75)
+        self.assertEqual(by_name["A"].reasons, ["one hit"])
+        self.assertEqual(by_name["B"].reasons, [])
+
+
+class NearTieTests(unittest.TestCase):
+    def _presets(self):
+        return [
+            make_preset("CC3D PETG A", vendor="CC3D", material="PETG"),
+            make_preset("CC3D PETG B", vendor="CC3D", material="PETG"),
+        ]
+
+    def test_top_70_with_runner_up_69_opens_a_chooser(self):
+        presets = self._presets()
+        obs = make_obs(vendor="CC3D", material="PETG",
+                       product="CC3D PETG Pro", color="#F06292")
+
+        def fake_score(_obs, preset):
+            return (70 if preset.name.endswith(" A") else 69), ["reason"]
+
+        with mock.patch.object(core, "score_preset", side_effect=fake_score):
+            result = core.match_observation(obs, presets)
+
+        self.assertEqual(result.preset_name, "")
+        self.assertEqual(len(result.candidates), 2)
+        self.assertEqual(
+            sorted(candidate.score for candidate in result.candidates), [69, 70])
+
+    def test_top_70_with_runner_up_50_still_selects(self):
+        presets = self._presets()
+        obs = make_obs(vendor="CC3D", material="PETG",
+                       product="CC3D PETG Pro", color="#F06292")
+
+        def fake_score(_obs, preset):
+            return (70 if preset.name.endswith(" A") else 50), ["reason"]
+
+        with mock.patch.object(core, "score_preset", side_effect=fake_score):
+            result = core.match_observation(obs, presets)
+
+        self.assertEqual(result.preset_name, presets[0].name)
+
+
+class ProvenanceTests(unittest.TestCase):
+    def test_arbitrary_parentheses_are_not_provenance(self):
+        self.assertEqual(core.strip_bundle_prefix("(Matte) eSUN PETG"),
+                         "(Matte) eSUN PETG")
+        self.assertNotEqual(
+            core.normalize_text(core.strip_bundle_prefix("(Matte) eSUN PETG")),
+            core.normalize_text(core.strip_bundle_prefix("eSUN PETG")),
+        )
+
+    def test_known_bundle_markers_are_still_stripped(self):
+        self.assertEqual(
+            core.strip_bundle_prefix("_local/filament_match/eSUN PETG (local)"),
+            "eSUN PETG (local)")
+        self.assertEqual(
+            core.strip_bundle_prefix("_subscribed/vendor/PLA"), "PLA")
+        self.assertEqual(core.strip_bundle_prefix("[OFD] AzureFilm TPU"),
+                         "AzureFilm TPU")
+        for value in ("bundle: PLA", "local: PLA", "user: PLA", "system: PLA"):
+            self.assertEqual(core.strip_bundle_prefix(value), "PLA")
+        self.assertEqual(core.strip_bundle_prefix("user-friendly PLA"),
+                         "user-friendly PLA")
+
+
+class LowLevelHygieneTests(unittest.TestCase):
+    def test_colour_parser_rejects_bare_lowercase_words(self):
+        self.assertEqual(core.normalize_color("facade"), "")
+        self.assertEqual(core.normalize_color("#facade"), "#facade")
+        self.assertEqual(core.normalize_color("0xFACADE"), "#facade")
+        self.assertEqual(core.normalize_color(0xFF0000), "#ff0000")
+        self.assertEqual(core.normalize_color("F06292FF"), "#f06292")
+        self.assertEqual(core.normalize_color("#F06292"), "#f06292")
+
+    def test_compatible_parses_string_booleans(self):
+        presets = [
+            make_preset("false", compatible="false"),
+            make_preset("zero", compatible="0"),
+            make_preset("false case", compatible="False"),
+            make_preset("number zero", compatible=0),
+            make_preset("true", compatible="true"),
+            make_preset("one", compatible="1"),
+        ]
+        names = [preset.name for preset in core._compatible(presets)]
+        self.assertEqual(names, ["true", "one"])
+
+    def test_placeholder_tag_uid_falls_through_to_filament_identity(self):
+        self.assertEqual(core.normalize_tag_uid("0000000000000000"), "")
+        self.assertEqual(core.normalize_tag_uid("0000"), "")
+        obs = make_obs(vendor="CC3D", material="PETG", product="Pink",
+                       color="#ff0000", tag_uid="0000000000000000")
+        self.assertTrue(core.identity_key(obs).startswith("filament:"))
+
+    def test_history_key_uses_legacy_fallback(self):
+        obs = make_obs(vendor="Полимер", material="PETG", product="PETG",
+                       color="#ff0000")
+        legacy_key = core._legacy_identity_key(obs)
+        self.assertTrue(legacy_key.startswith("filament:"))
+        self.assertNotEqual(legacy_key, core.identity_key(obs))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.json"
+            path.write_text(json.dumps({
+                "version": 1,
+                "spools": {},
+                "tags": {},
+                "filaments": {
+                    legacy_key.split(":", 1)[1]: {"default": "Legacy Preset"}
+                },
+            }), encoding="utf-8")
+            store = core.HistoryStore(path)
+            self.assertEqual(store.load_error, "")
+            self.assertEqual(store.get(obs, "U1"), "Legacy Preset")
+
+    def test_remember_writes_version_two_and_only_the_new_key(self):
+        obs = make_obs(vendor="Полимер", material="PETG", product="PETG",
+                       color="#ff0000")
+        legacy_part = core._legacy_identity_key(obs).split(":", 1)[1]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.json"
+            path.write_text(json.dumps({
+                "version": 1,
+                "spools": {},
+                "tags": {},
+                "filaments": {legacy_part: {"default": "Legacy Preset"}},
+            }), encoding="utf-8")
+            store = core.HistoryStore(path)
+            store.remember(obs, "U1", "New Preset")
+            document = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(document["version"], 2)
+        self.assertEqual(document["filaments"][legacy_part]["default"],
+                         "Legacy Preset")
+        self.assertEqual(len([
+            key for key in document["filaments"]
+            if document["filaments"][key]["default"] == "New Preset"
+        ]), 1)
 
 
 if __name__ == "__main__":
