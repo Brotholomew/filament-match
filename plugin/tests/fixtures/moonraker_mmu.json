@@ -1,0 +1,13 @@
+{
+  "result": {
+    "status": {
+      "mmu": {
+        "num_gates": 4,
+        "gate_status": [1, 2, 0, -1],
+        "gate_material": ["PLA", "PETG", "ABS", "TPU"],
+        "gate_color": ["#FF0000", "#00FF00", "#0000FF", "#112233"],
+        "gate_temperature": [210, 240, 0, 0]
+      }
+    }
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "result": {
+    "namespace": "lane_data",
+    "value": {
+      "lane1": {
+        "lane": "0",
+        "material": "PLA",
+        "color": "#FF0000",
+        "bed_temp": 60,
+        "nozzle_temp": 210,
+        "filament_id": "OFDPLA"
+      },
+      "lane2": {
+        "lane": 1,
+        "material": "PETG",
+        "color": "#00FF00"
+      },
+      "lane3": {
+        "lane": "2",
+        "material": "",
+        "color": "#0000FF",
+        "spool_id": 5
+      },
+      "lane4": {
+        "lane": "-1",
+        "material": "ABS",
+        "color": "#112233"
+      },
+      "lane5": {
+        "material": "TPU",
+        "color": "#445566"
+      },
+      "lane6": {
+        "lane": "3",
+        "material": "ABS",
+        "color": "#112233",
+        "vendor_name": "Acme",
+        "spool_id": 7,
+        "filament_id": 123
+      }
+    }
+  }
+}
