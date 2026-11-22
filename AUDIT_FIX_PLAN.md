@@ -1,8 +1,19 @@
 # Filament Match — Audit Fix Implementation Plan
 
-Status: **planning only**. No production code has been changed. No release or tag may be created until the final gate and your sign-off.
+Status: **implementation complete on `fix/audit-2026-11-22`; awaiting manual sign-off and release approval**. No tag or release has been created.
 
 Target: fix every confirmed finding from the audit, keep the currently working Snapmaker U1 / Spoolman / OFD / price-copy / slot-mismatch behavior intact, and add regression coverage for every repaired path.
+
+Current verification evidence:
+
+- Full local suite: **440 tests, OK**
+- Independent audit harness: **14/14 checks pass**
+- CI matrix: **Ubuntu, macOS and Windows, all green**
+- Real Orca clone:
+  - canonical slash/quote local preset names load and select;
+  - OFD candidate installs, reloads and selects;
+  - CC3D user-preset price copy inherits `Generic PETG @U1 0.4 nozzle`, preserves temperatures and applies `10.07/kg`;
+  - live scan against the mock printer returns the expected candidates.
 
 ---
 
